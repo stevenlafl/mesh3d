@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: mesh3d_db
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: mesh3d
+      POSTGRES_USER: mesh3d
+      POSTGRES_PASSWORD: mesh3d
+    volumes:
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - mesh3d_pgdata:/var/lib/postgresql/data
+
+  build:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.build
+    container_name: mesh3d_build
+    volumes:
+      - .:/src
+    command: >
+      bash -c "cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j$(nproc)"
+
+volumes:
+  mesh3d_pgdata:
