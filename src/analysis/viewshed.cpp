@@ -1,4 +1,5 @@
 #include "analysis/viewshed.h"
+#include "analysis/gpu_viewshed.h"
 #include "util/log.h"
 #include <cmath>
 #include <algorithm>
@@ -147,6 +148,54 @@ void recompute_all_viewsheds(Scene& scene, const GeoProjection& proj) {
     /* Tile-based elevation path — compute overlays per cached tile */
     if (scene.use_tile_system) {
         scene.tile_manager.apply_viewshed_overlays(scene.nodes, proj);
+        return;
+    }
+
+    LOG_WARN("No elevation data available for viewshed computation");
+}
+
+void recompute_all_viewsheds_gpu(Scene& scene, const GeoProjection& proj,
+                                  GpuViewshed* gpu) {
+    /* Fall back to CPU if GPU is not available */
+    if (!gpu || !GpuViewshed::is_available()) {
+        recompute_all_viewsheds(scene, proj);
+        return;
+    }
+
+    /* Scene-level elevation grid path */
+    if (!scene.elevation.empty() && scene.grid_rows >= 2 && scene.grid_cols >= 2) {
+        int rows = scene.grid_rows;
+        int cols = scene.grid_cols;
+        int total = rows * cols;
+
+        if (scene.nodes.empty()) {
+            scene.viewshed_vis.assign(total, 0);
+            scene.signal_strength.assign(total, -999.0f);
+            scene.overlap_count.assign(total, 0);
+            scene.build_terrain();
+            LOG_INFO("Viewshed cleared (no nodes)");
+            return;
+        }
+
+        /* Upload elevation and compute on GPU */
+        gpu->upload_elevation(scene.elevation.data(), rows, cols);
+        gpu->set_grid_params(scene.bounds, rows, cols);
+        gpu->compute_all(scene.nodes);
+        gpu->read_back(scene.viewshed_vis, scene.signal_strength, scene.overlap_count);
+
+        scene.build_terrain();
+
+        int vis_count = 0;
+        for (auto v : scene.viewshed_vis) vis_count += v;
+        float pct = 100.0f * vis_count / total;
+        LOG_INFO("GPU viewshed computed for %zu nodes: %.1f%% coverage",
+                 scene.nodes.size(), pct);
+        return;
+    }
+
+    /* Tile-based elevation path */
+    if (scene.use_tile_system) {
+        scene.tile_manager.apply_viewshed_overlays_gpu(scene.nodes, proj, gpu);
         return;
     }
 

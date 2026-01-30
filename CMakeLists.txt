@@ -45,6 +45,8 @@ set(LIB_SOURCES
     src/cabi/cabi.cpp
     src/ui/hud.cpp
     src/analysis/viewshed.cpp
+    src/analysis/gpu_viewshed.cpp
+    src/render/compute_shader.cpp
     src/util/log.cpp
     src/tile/tile_provider.cpp
     src/tile/single_tile_provider.cpp

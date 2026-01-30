@@ -7,6 +7,7 @@
 #include "camera/camera.h"
 #include "camera/input.h"
 #include "ui/hud.h"
+#include "analysis/gpu_viewshed.h"
 #include "util/math_util.h"
 #include <mesh3d/types.h>
 
@@ -54,6 +55,8 @@ private:
     std::string  m_shader_dir;
     GeoProjection m_proj;
     bool m_hgt_mode = false;
+    bool m_has_compute = false;
+    GpuViewshed m_gpu_viewshed;
 
     /* HUD state */
     bool m_show_controls = true;

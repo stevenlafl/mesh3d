@@ -1,0 +1,82 @@
+#version 430 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r32f)  uniform readonly  image2D  uElevation;
+layout(binding = 1, r8ui)  uniform writeonly uimage2D uVisibility;
+layout(binding = 2, r32f)  uniform writeonly image2D  uSignal;
+
+uniform ivec2 uGridSize;        // (cols, rows)
+uniform ivec2 uNodeCell;        // (col, row) of the node
+uniform float uObserverHeight;  // node_elev + antenna_height
+uniform int   uMaxRangeCells;
+uniform float uTxPowerDbm;
+uniform float uAntennaGainDbi;
+uniform float uFreqMhz;
+uniform float uCellMeters;
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    int c = gid.x;
+    int r = gid.y;
+
+    if (c >= uGridSize.x || r >= uGridSize.y)
+        return;
+
+    int dc = c - uNodeCell.x;
+    int dr = r - uNodeCell.y;
+    float dist_cells = sqrt(float(dc * dc + dr * dr));
+
+    /* Node's own cell */
+    if (dist_cells < 0.5) {
+        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(-60.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    /* Out of range */
+    if (dist_cells > float(uMaxRangeCells)) {
+        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    /* Ray-march line-of-sight check */
+    float target_elev = imageLoad(uElevation, gid).r;
+    int steps = int(dist_cells * 1.5) + 1;
+    bool blocked = false;
+
+    for (int s = 1; s < steps; ++s) {
+        float t = float(s) / float(steps);
+        float sr = float(uNodeCell.y) + float(dr) * t;
+        float sc = float(uNodeCell.x) + float(dc) * t;
+        int si = int(sr);
+        int sj = int(sc);
+
+        if (si < 0 || si >= uGridSize.y || sj < 0 || sj >= uGridSize.x)
+            continue;
+
+        /* Height the LOS ray passes at this point */
+        float needed_h = uObserverHeight + (target_elev - uObserverHeight) * t;
+        float terrain_h = imageLoad(uElevation, ivec2(sj, si)).r;
+        if (terrain_h > needed_h + 1.0) {
+            blocked = true;
+            break;
+        }
+    }
+
+    if (blocked) {
+        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
+    } else {
+        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+
+        /* Free-space path loss */
+        float dist_km = dist_cells * uCellMeters / 1000.0;
+        dist_km = max(dist_km, 0.01);
+        float fspl = 20.0 * log(dist_km) / log(10.0)
+                   + 20.0 * log(uFreqMhz) / log(10.0)
+                   + 32.44;
+        float sig = uTxPowerDbm + uAntennaGainDbi - fspl;
+        imageStore(uSignal, gid, vec4(sig, 0.0, 0.0, 0.0));
+    }
+}

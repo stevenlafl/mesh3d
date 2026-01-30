@@ -2,6 +2,7 @@
 #include "tile/hgt_provider.h"
 #include "tile/url_tile_provider.h"
 #include "analysis/viewshed.h"
+#include "analysis/gpu_viewshed.h"
 #include "scene/scene.h"
 #include "camera/camera.h"
 #include "util/log.h"
@@ -343,6 +344,37 @@ void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
     });
 
     LOG_INFO("Applied viewshed overlays to cached tiles for %zu nodes", nodes.size());
+}
+
+void TileManager::apply_viewshed_overlays_gpu(const std::vector<NodeData>& nodes,
+                                                const GeoProjection& proj,
+                                                GpuViewshed* gpu) {
+    if (!gpu) {
+        apply_viewshed_overlays(nodes, proj);
+        return;
+    }
+
+    m_cache.for_each_mut([&](TileRenderable& tr) {
+        if (tr.elevation.empty() || tr.elev_rows < 2 || tr.elev_cols < 2)
+            return;
+
+        int total = tr.elev_rows * tr.elev_cols;
+
+        /* Upload tile elevation and compute on GPU */
+        gpu->upload_elevation(tr.elevation.data(), tr.elev_rows, tr.elev_cols);
+        gpu->set_grid_params(tr.bounds, tr.elev_rows, tr.elev_cols);
+        gpu->compute_all(nodes);
+
+        std::vector<uint8_t> overlap;
+        gpu->read_back(tr.viewshed, tr.signal, overlap);
+
+        /* Rebuild mesh with overlay data (preserves texture) */
+        Texture saved_tex = std::move(tr.texture);
+        tr.mesh = m_builder.rebuild_mesh(tr, m_proj);
+        tr.texture = std::move(saved_tex);
+    });
+
+    LOG_INFO("Applied GPU viewshed overlays to cached tiles for %zu nodes", nodes.size());
 }
 
 void TileManager::clear() {

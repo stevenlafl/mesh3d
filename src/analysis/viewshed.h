@@ -6,6 +6,8 @@
 
 namespace mesh3d {
 
+class GpuViewshed;
+
 /* Compute line-of-sight viewshed and signal strength for a single node
    on an elevation grid.
 
@@ -27,5 +29,9 @@ void compute_viewshed(const float* elevation, int rows, int cols,
    then rebuild the terrain mesh. Uses scene.elevation grid.
    For tile-based scenes, does nothing (no scene-level grid). */
 void recompute_all_viewsheds(Scene& scene, const GeoProjection& proj);
+
+/* GPU-accelerated version. Falls back to CPU if gpu is null or unavailable. */
+void recompute_all_viewsheds_gpu(Scene& scene, const GeoProjection& proj,
+                                  GpuViewshed* gpu);
 
 } // namespace mesh3d

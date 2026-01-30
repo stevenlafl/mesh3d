@@ -44,7 +44,7 @@ bool App::init(int width, int height, const char* title) {
         return false;
     }
 
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
@@ -79,7 +79,16 @@ bool App::init(int width, int height, const char* title) {
     LOG_INFO("OpenGL %s, GLSL %s",
              glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
 
+    /* Check for compute shader support (GL 4.3+) */
+    GLint gl_major = 0, gl_minor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &gl_major);
+    glGetIntegerv(GL_MINOR_VERSION, &gl_minor);
+    m_has_compute = (gl_major > 4) || (gl_major == 4 && gl_minor >= 3);
+    LOG_INFO("Compute shader support: %s (GL %d.%d)",
+             m_has_compute ? "yes" : "no", gl_major, gl_minor);
+
     /* Find shader directory (look relative to executable or cwd) */
+    /* (GpuViewshed init happens after shader_dir is found, below) */
     namespace fs = std::filesystem;
     for (auto& candidate : {"shaders", "../shaders", "../../shaders"}) {
         if (fs::exists(candidate)) {
@@ -97,6 +106,14 @@ bool App::init(int width, int height, const char* title) {
         return false;
     }
 
+    /* Initialize GPU viewshed compute shaders (optional, falls back to CPU) */
+    if (m_has_compute) {
+        if (!m_gpu_viewshed.init(m_shader_dir)) {
+            LOG_WARN("GPU viewshed init failed, will use CPU fallback");
+            m_has_compute = false;
+        }
+    }
+
     /* Initialize HUD */
     std::string font_path = find_font_path();
     if (!m_hud.init(m_shader_dir, font_path)) {
@@ -112,6 +129,7 @@ bool App::init(int width, int height, const char* title) {
 }
 
 void App::shutdown() {
+    m_gpu_viewshed.shutdown();
     m_hud.shutdown();
     scene.clear();
     if (m_gl_ctx) { SDL_GL_DeleteContext(m_gl_ctx); m_gl_ctx = nullptr; }
@@ -325,7 +343,7 @@ void App::handle_menu_input() {
                 scene.nodes.erase(scene.nodes.begin() + node_idx);
                 scene.build_markers();
                 scene.build_spheres();
-                recompute_all_viewsheds(scene, m_proj);
+                recompute_all_viewsheds_gpu(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
                 menu.editing_node = -1;
                 menu.device_select_node = -1;
                 LOG_INFO("Deleted node %d from menu", node_idx);
@@ -486,7 +504,7 @@ void App::place_node_at(const glm::vec3& world_pos) {
     /* Rebuild markers, spheres, and viewsheds */
     scene.build_markers();
     scene.build_spheres();
-    recompute_all_viewsheds(scene, m_proj);
+    recompute_all_viewsheds_gpu(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
 
     LOG_INFO("Placed node '%s' at (%.4f, %.4f, %.0fm)", node.name, ll.lat, ll.lon, world_pos.y);
 }
@@ -511,7 +529,7 @@ void App::delete_nearest_node(const glm::vec3& world_pos) {
         scene.nodes.erase(scene.nodes.begin() + nearest);
         scene.build_markers();
         scene.build_spheres();
-        recompute_all_viewsheds(scene, m_proj);
+        recompute_all_viewsheds_gpu(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
     }
 }
 

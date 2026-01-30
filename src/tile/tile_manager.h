@@ -62,6 +62,11 @@ public:
     void apply_viewshed_overlays(const std::vector<NodeData>& nodes,
                                   const GeoProjection& proj);
 
+    /* GPU-accelerated version of apply_viewshed_overlays */
+    void apply_viewshed_overlays_gpu(const std::vector<NodeData>& nodes,
+                                      const GeoProjection& proj,
+                                      class GpuViewshed* gpu);
+
     /* Access for configuration */
     TileSelector& selector() { return m_selector; }
     TileTerrainBuilder& builder() { return m_builder; }
