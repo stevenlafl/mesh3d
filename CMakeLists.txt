@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ── Dependencies ──────────────────────────────────────────────────────
 find_package(SDL2 REQUIRED)
 find_package(OpenGL REQUIRED)
+find_package(CURL REQUIRED)
 
 # libpq
 find_path(LIBPQ_INCLUDE_DIR libpq-fe.h
@@ -52,6 +53,14 @@ set(LIB_SOURCES
     src/camera/input.cpp
     src/cabi/cabi.cpp
     src/util/log.cpp
+    src/tile/tile_provider.cpp
+    src/tile/single_tile_provider.cpp
+    src/tile/url_tile_provider.cpp
+    src/tile/tile_cache.cpp
+    src/tile/tile_terrain_builder.cpp
+    src/tile/tile_selector.cpp
+    src/tile/tile_manager.cpp
+    src/tile/disk_cache.cpp
 )
 
 add_library(mesh3d_lib SHARED ${LIB_SOURCES})
@@ -60,7 +69,7 @@ target_include_directories(mesh3d_lib
     PRIVATE src ${LIBPQ_INCLUDE_DIR} ${GLM_INCLUDE_DIR}
 )
 target_link_libraries(mesh3d_lib
-    PUBLIC  glad stb OpenGL::GL ${LIBPQ_LIBRARY}
+    PUBLIC  glad stb OpenGL::GL ${LIBPQ_LIBRARY} CURL::libcurl
 )
 target_compile_definitions(mesh3d_lib PRIVATE MESH3D_EXPORTS)
 

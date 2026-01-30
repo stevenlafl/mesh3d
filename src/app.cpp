@@ -173,6 +173,10 @@ void App::toggle_wireframe() {
     LOG_INFO("Wireframe: %s", renderer.wireframe() ? "ON" : "OFF");
 }
 
+void App::cycle_imagery_source() {
+    scene.tile_manager.cycle_imagery_source();
+}
+
 void App::rebuild_scene() {
     scene.rebuild_all();
 }
@@ -184,6 +188,7 @@ void App::handle_toggles() {
     }
     if (m_input.consume_key1()) set_overlay_mode(MESH3D_OVERLAY_VIEWSHED);
     if (m_input.consume_key2()) set_overlay_mode(MESH3D_OVERLAY_SIGNAL);
+    if (m_input.consume_key3()) cycle_imagery_source();
     if (m_input.consume_keyT()) toggle_signal_spheres();
     if (m_input.consume_keyF()) toggle_wireframe();
 }
@@ -204,6 +209,11 @@ bool App::poll_events() {
 void App::frame(float dt) {
     handle_toggles();
     m_input.update(camera, dt);
+
+    /* Update tile system (fetches/uploads missing tiles) */
+    if (scene.use_tile_system) {
+        scene.tile_manager.update();
+    }
 
     float aspect = static_cast<float>(m_width) / std::max(m_height, 1);
     renderer.render(scene, camera, aspect);

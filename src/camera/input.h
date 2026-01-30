@@ -17,6 +17,7 @@ public:
     bool consume_tab()   { bool v = m_tab; m_tab = false; return v; }
     bool consume_key1()  { bool v = m_key1; m_key1 = false; return v; }
     bool consume_key2()  { bool v = m_key2; m_key2 = false; return v; }
+    bool consume_key3()  { bool v = m_key3; m_key3 = false; return v; }
     bool consume_keyT()  { bool v = m_keyT; m_keyT = false; return v; }
     bool consume_keyF()  { bool v = m_keyF; m_keyF = false; return v; }
 
@@ -31,7 +32,7 @@ private:
     bool m_up = false, m_down = false;
 
     /* toggle keys (edge-triggered) */
-    bool m_tab = false, m_key1 = false, m_key2 = false;
+    bool m_tab = false, m_key1 = false, m_key2 = false, m_key3 = false;
     bool m_keyT = false, m_keyF = false;
 };
 

@@ -2,6 +2,8 @@
 #include "scene/terrain.h"
 #include "scene/node_marker.h"
 #include "scene/signal_sphere.h"
+#include "tile/single_tile_provider.h"
+#include "tile/url_tile_provider.h"
 #include "util/math_util.h"
 #include "util/color.h"
 #include "util/log.h"
@@ -25,6 +27,8 @@ void Scene::clear() {
     signal_strength.clear();
     overlap_count.clear();
     grid_rows = grid_cols = 0;
+    tile_manager.clear();
+    use_tile_system = false;
 }
 
 void Scene::build_terrain(float elev_scale) {
@@ -115,6 +119,30 @@ void Scene::rebuild_all() {
     build_flat_plane();
     build_markers();
     build_spheres();
+    init_tile_provider();
+}
+
+void Scene::init_tile_provider() {
+    if (elevation.empty() || grid_rows < 2 || grid_cols < 2) {
+        use_tile_system = false;
+        return;
+    }
+
+    /* Set up elevation provider from scene data */
+    auto elev = std::make_unique<SingleTileProvider>();
+    elev->set_data(bounds,
+                   elevation.data(), grid_rows, grid_cols,
+                   viewshed_vis.empty() ? nullptr : viewshed_vis.data(),
+                   signal_strength.empty() ? nullptr : signal_strength.data());
+
+    tile_manager.set_elevation_provider(std::move(elev));
+    tile_manager.set_bounds(bounds);
+
+    /* Set up default imagery provider */
+    tile_manager.set_imagery_provider(UrlTileProvider::satellite());
+
+    use_tile_system = true;
+    LOG_INFO("Tile system initialized");
 }
 
 } // namespace mesh3d

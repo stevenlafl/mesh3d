@@ -9,6 +9,7 @@ int main(int argc, char* argv[]) {
     int width = 1280, height = 720;
     const char* title = "mesh3d — 3D Viewshed Visualizer";
     const char* db_conninfo = nullptr;
+    const char* texture_path = nullptr;
     int project_id = -1;
 
     /* Simple arg parsing */
@@ -21,12 +22,15 @@ int main(int argc, char* argv[]) {
             width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
             height = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--texture") == 0 && i + 1 < argc) {
+            texture_path = argv[++i];
         } else if (std::strcmp(argv[i], "--debug") == 0) {
             log_set_level(LogLevel::Debug);
         } else if (std::strcmp(argv[i], "--help") == 0) {
             printf("Usage: mesh3d [options]\n"
                    "  --db CONNINFO     PostgreSQL connection string\n"
                    "  --project ID      Project ID to load\n"
+                   "  --texture PATH    Load satellite texture from file\n"
                    "  --width W         Window width (default 1280)\n"
                    "  --height H        Window height (default 720)\n"
                    "  --debug           Enable debug logging\n"
@@ -39,6 +43,7 @@ int main(int argc, char* argv[]) {
                    "  Tab         Toggle terrain/flat mode\n"
                    "  1           Viewshed overlay\n"
                    "  2           Signal strength overlay\n"
+                   "  3           Cycle imagery (satellite/street/none)\n"
                    "  T           Toggle signal spheres\n"
                    "  F           Toggle wireframe\n"
                    "  Escape      Release mouse / quit\n");
@@ -60,6 +65,15 @@ int main(int argc, char* argv[]) {
             if (!a.load_project(project_id)) {
                 LOG_WARN("Failed to load project %d, running with demo data", project_id);
             }
+        }
+    }
+
+    /* Load manual texture override if specified */
+    if (texture_path) {
+        if (a.scene.satellite_tex.load(texture_path)) {
+            LOG_INFO("Loaded texture: %s", texture_path);
+        } else {
+            LOG_WARN("Failed to load texture: %s", texture_path);
         }
     }
 

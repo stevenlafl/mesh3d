@@ -1,5 +1,6 @@
 #include "render/renderer.h"
 #include "scene/scene.h"
+#include "tile/tile_manager.h"
 #include "camera/camera.h"
 #include "util/log.h"
 #include <algorithm>
@@ -60,7 +61,22 @@ void Renderer::opaque_pass(const Scene& scene, const Camera& cam, float aspect) 
     glDisable(GL_BLEND);
 
     /* Terrain or flat plane */
-    if (scene.render_mode == MESH3D_MODE_TERRAIN && scene.terrain_mesh.valid()) {
+    if (scene.render_mode == MESH3D_MODE_TERRAIN && scene.use_tile_system &&
+        scene.tile_manager.has_terrain()) {
+        /* Tile-based terrain rendering */
+        setup_common_uniforms(terrain_shader, cam, aspect);
+        terrain_shader.set_int("uOverlayMode", static_cast<int>(scene.overlay_mode));
+        terrain_shader.set_vec3("uLightDir", glm::normalize(glm::vec3(0.3f, 1.0f, 0.5f)));
+        const_cast<TileManager&>(scene.tile_manager).render([&](const TileRenderable& tile) {
+            terrain_shader.set_mat4("uModel", tile.model);
+            terrain_shader.set_int("uUseSatelliteTex", tile.texture.valid() ? 1 : 0);
+            if (tile.texture.valid()) {
+                tile.texture.bind(0);
+                terrain_shader.set_int("uSatelliteTex", 0);
+            }
+            tile.mesh.draw();
+        });
+    } else if (scene.render_mode == MESH3D_MODE_TERRAIN && scene.terrain_mesh.valid()) {
         setup_common_uniforms(terrain_shader, cam, aspect);
         terrain_shader.set_mat4("uModel", scene.terrain_model);
         terrain_shader.set_int("uOverlayMode", static_cast<int>(scene.overlay_mode));

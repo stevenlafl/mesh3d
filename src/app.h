@@ -33,6 +33,7 @@ public:
     void toggle_signal_spheres();
     void toggle_wireframe();
     void rebuild_scene();
+    void cycle_imagery_source();
 
     /* Main loop */
     void run();

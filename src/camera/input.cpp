@@ -22,6 +22,7 @@ void InputHandler::process_event(const SDL_Event& ev, Camera& cam) {
             case SDLK_TAB:    m_tab  = true; break;
             case SDLK_1:      m_key1 = true; break;
             case SDLK_2:      m_key2 = true; break;
+            case SDLK_3:      m_key3 = true; break;
             case SDLK_t:      m_keyT = true; break;
             case SDLK_f:      m_keyF = true; break;
             case SDLK_ESCAPE:

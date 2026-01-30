@@ -1,6 +1,7 @@
 #pragma once
 #include "render/mesh.h"
 #include "render/texture.h"
+#include "tile/tile_manager.h"
 #include <mesh3d/types.h>
 #include <glm/glm.hpp>
 #include <vector>
@@ -52,12 +53,17 @@ struct Scene {
     std::vector<float>   signal_strength; // merged signal (dBm)
     std::vector<uint8_t> overlap_count;
 
+    /* Tile system */
+    TileManager tile_manager;
+    bool use_tile_system = false;
+
     void clear();
     void build_terrain(float elev_scale = 1.0f);
     void build_flat_plane();
     void build_markers();
     void build_spheres();
     void rebuild_all();
+    void init_tile_provider();
 };
 
 } // namespace mesh3d
