@@ -3,6 +3,7 @@
 #include "util/log.h"
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 
 namespace mesh3d {
 
@@ -29,9 +30,6 @@ void compute_viewshed(const float* elevation, int rows, int cols,
     if (antenna_h < 1.0f) antenna_h = 2.0f;
     float obs_h = node_elev + antenna_h;
 
-    float max_range_km = node.info.max_range_km;
-    if (max_range_km <= 0) max_range_km = 5.0f;
-
     /* Approximate cell size in meters (~30m for SRTM1 at mid-latitudes) */
     double center_lat = (bounds.min_lat + bounds.max_lat) * 0.5;
     double m_per_deg_lat = 111320.0;
@@ -39,9 +37,6 @@ void compute_viewshed(const float* elevation, int rows, int cols,
     float cell_m_lat = static_cast<float>(lat_res * m_per_deg_lat);
     float cell_m_lon = static_cast<float>(lon_res * m_per_deg_lon);
     float cell_m = (cell_m_lat + cell_m_lon) * 0.5f;
-
-    int max_range_cells = static_cast<int>(max_range_km * 1000.0f / cell_m);
-    if (max_range_cells < 1) max_range_cells = 1;
 
     /* TX power for signal calculation */
     float tx_power_dbm = node.info.tx_power_dbm;
@@ -52,6 +47,21 @@ void compute_viewshed(const float* elevation, int rows, int cols,
     float cable_loss = node.info.cable_loss_db;
     float rx_sens = node.info.rx_sensitivity_dbm;
     if (rx_sens >= 0) rx_sens = -132.0f; // default
+
+    /* Max range from link budget: distance where FSPL alone exceeds budget.
+       Terrain and diffraction further reduce actual coverage. */
+    float eirp = tx_power_dbm + antenna_gain - cable_loss;
+    float max_path_loss = eirp - rx_sens;
+    float log_d_km = (max_path_loss - 20.0f * std::log10(freq_mhz) - 32.44f) / 20.0f;
+    float max_range_km = std::pow(10.0f, log_d_km);
+
+    /* Cap at grid diagonal */
+    float grid_diag_km = std::sqrt(static_cast<float>(rows * rows + cols * cols))
+                         * cell_m / 1000.0f;
+    if (max_range_km > grid_diag_km) max_range_km = grid_diag_km;
+
+    int max_range_cells = static_cast<int>(max_range_km * 1000.0f / cell_m);
+    if (max_range_cells < 1) max_range_cells = 1;
 
     /* Earth curvature factor: 1 / (2 * k * Re) where k=4/3, Re=6371000m */
     const float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
@@ -235,6 +245,81 @@ void recompute_all_viewsheds_gpu(Scene& scene, const GeoProjection& proj,
     }
 
     LOG_WARN("No elevation data available for viewshed computation");
+}
+
+void kick_viewshed_recompute(Scene& scene, const GeoProjection& proj,
+                              GpuViewshed* gpu) {
+    /* Fall back to blocking CPU path if GPU not available */
+    if (!gpu || !GpuViewshed::is_available()) {
+        LOG_INFO("kick_viewshed: CPU fallback (gpu=%p, available=%s)",
+                 (void*)gpu, (gpu && GpuViewshed::is_available()) ? "yes" : "no");
+        auto t0 = std::chrono::steady_clock::now();
+        recompute_all_viewsheds(scene, proj);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        LOG_INFO("kick_viewshed: CPU fallback took %lld ms", (long long)ms);
+        return;
+    }
+
+    /* Scene-level elevation grid path */
+    if (!scene.elevation.empty() && scene.grid_rows >= 2 && scene.grid_cols >= 2) {
+        int rows = scene.grid_rows;
+        int cols = scene.grid_cols;
+        int total = rows * cols;
+
+        if (scene.nodes.empty()) {
+            scene.viewshed_vis.assign(total, 0);
+            scene.signal_strength.assign(total, -999.0f);
+            scene.overlap_count.assign(total, 0);
+            scene.build_terrain();
+            LOG_INFO("Viewshed cleared (no nodes)");
+            return;
+        }
+
+        LOG_INFO("kick_viewshed: GPU async scene-level (%dx%d, %zu nodes)",
+                 cols, rows, scene.nodes.size());
+        gpu->upload_elevation(scene.elevation.data(), rows, cols);
+        gpu->set_grid_params(scene.bounds, rows, cols);
+        gpu->compute_all_async(scene.nodes, scene.elevation.data());
+        return;
+    }
+
+    /* Tile-based elevation path — dispatch per-tile GPU viewshed */
+    if (scene.use_tile_system) {
+        LOG_INFO("kick_viewshed: GPU async tile path (%zu nodes)",
+                 scene.nodes.size());
+        scene.tile_manager.kick_viewshed_gpu(scene.nodes, proj, gpu);
+        return;
+    }
+
+    LOG_WARN("No elevation data available for viewshed computation");
+}
+
+void poll_viewshed_recompute(Scene& scene, const GeoProjection& proj,
+                              GpuViewshed* gpu) {
+    if (!gpu) return;
+
+    /* Scene-level grid path */
+    if (!scene.elevation.empty() && scene.grid_rows >= 2 && scene.grid_cols >= 2) {
+        if (gpu->poll_state() != ComputeState::READY) return;
+
+        gpu->read_back_async(scene.viewshed_vis, scene.signal_strength,
+                              scene.overlap_count);
+        scene.build_terrain();
+
+        int vis_count = 0;
+        for (auto v : scene.viewshed_vis) vis_count += v;
+        int total = scene.grid_rows * scene.grid_cols;
+        float pct = 100.0f * vis_count / total;
+        LOG_INFO("Async GPU viewshed computed for %zu nodes: %.1f%% coverage",
+                 scene.nodes.size(), pct);
+        return;
+    }
+
+    /* Tile-based path */
+    if (scene.use_tile_system) {
+        scene.tile_manager.poll_viewshed_gpu(scene.nodes, proj, gpu);
+    }
 }
 
 } // namespace mesh3d

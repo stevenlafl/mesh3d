@@ -89,6 +89,17 @@ void Renderer::opaque_pass(const Scene& scene, const Camera& cam, float aspect) 
                 tile.texture.bind(0);
                 terrain_shader.set_int("uSatelliteTex", 0);
             }
+            /* Bind GPU overlay textures if available (avoids mesh rebuild) */
+            terrain_shader.set_int("uUseOverlayTex", tile.overlay_tex_valid ? 1 : 0);
+            if (tile.overlay_tex_valid) {
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, tile.overlay_vis_tex);
+                terrain_shader.set_int("uOverlayVisTex", 1);
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, tile.overlay_sig_tex);
+                terrain_shader.set_int("uOverlaySigTex", 2);
+                glActiveTexture(GL_TEXTURE0);
+            }
             tile.mesh.draw();
         });
     } else if (scene.render_mode == MESH3D_MODE_TERRAIN && scene.terrain_mesh.valid()) {
@@ -96,6 +107,7 @@ void Renderer::opaque_pass(const Scene& scene, const Camera& cam, float aspect) 
         terrain_shader.set_mat4("uModel", scene.terrain_model);
         terrain_shader.set_int("uOverlayMode", static_cast<int>(scene.overlay_mode));
         terrain_shader.set_int("uUseSatelliteTex", scene.satellite_tex.valid() ? 1 : 0);
+        terrain_shader.set_int("uUseOverlayTex", 0);
         terrain_shader.set_vec3("uLightDir", glm::normalize(glm::vec3(0.3f, 1.0f, 0.5f)));
         terrain_shader.set_float("uRxSensitivity", -132.0f); // default
         if (scene.satellite_tex.valid()) {

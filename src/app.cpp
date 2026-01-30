@@ -125,11 +125,15 @@ bool App::init(int width, int height, const char* title) {
     camera.position = glm::vec3(0, 500, 200);
     camera.rotate(0, 0); // force vector update
 
+    /* Start async tile loader */
+    scene.tile_manager.start_loader();
+
     LOG_INFO("mesh3d initialized (%dx%d)", width, height);
     return true;
 }
 
 void App::shutdown() {
+    scene.tile_manager.stop_loader();
     m_gpu_viewshed.shutdown();
     m_hud.shutdown();
     scene.clear();
@@ -347,6 +351,10 @@ void App::handle_menu_input() {
             SDL_Event quit_ev;
             quit_ev.type = SDL_QUIT;
             SDL_PushEvent(&quit_ev);
+        } else if (result == 4) {
+            // Kick async viewshed recompute
+            kick_viewshed_recompute(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+            m_viewshed_pending = true;
         }
     }
 
@@ -359,7 +367,8 @@ void App::handle_menu_input() {
                 scene.nodes.erase(scene.nodes.begin() + node_idx);
                 scene.build_markers();
                 scene.build_spheres();
-                recompute_all_viewsheds_gpu(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+                kick_viewshed_recompute(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+                m_viewshed_pending = true;
                 menu.editing_node = -1;
                 menu.device_select_node = -1;
                 LOG_INFO("Deleted node %d from menu", node_idx);
@@ -492,6 +501,7 @@ std::optional<glm::vec3> App::raycast_terrain() {
 }
 
 void App::place_node_at(const glm::vec3& world_pos) {
+    auto t_place_start = std::chrono::steady_clock::now();
     auto ll = m_proj.unproject(world_pos.x, world_pos.z);
 
     /* Use default hardware profile (heltec_v3) */
@@ -520,11 +530,22 @@ void App::place_node_at(const glm::vec3& world_pos) {
     nd.world_pos = glm::vec3(world_pos.x, world_pos.y + node.antenna_height_m, world_pos.z);
     scene.nodes.push_back(nd);
 
-    /* Rebuild markers, spheres, and viewsheds */
+    /* Rebuild markers, spheres, and kick async viewshed */
+    auto t0 = std::chrono::steady_clock::now();
     scene.build_markers();
+    auto t1 = std::chrono::steady_clock::now();
     scene.build_spheres();
-    recompute_all_viewsheds_gpu(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+    auto t2 = std::chrono::steady_clock::now();
+    kick_viewshed_recompute(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+    auto t3 = std::chrono::steady_clock::now();
+    m_viewshed_pending = true;
 
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
+    LOG_INFO("place_node_at: markers=%lldms spheres=%lldms kick=%lldms total=%lldms",
+             (long long)ms(t0,t1), (long long)ms(t1,t2), (long long)ms(t2,t3),
+             (long long)ms(t_place_start,t3));
     LOG_INFO("Placed node '%s' at (%.4f, %.4f, %.0fm)", node.name, ll.lat, ll.lon, world_pos.y);
 }
 
@@ -548,7 +569,8 @@ void App::delete_nearest_node(const glm::vec3& world_pos) {
         scene.nodes.erase(scene.nodes.begin() + nearest);
         scene.build_markers();
         scene.build_spheres();
-        recompute_all_viewsheds_gpu(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+        kick_viewshed_recompute(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+        m_viewshed_pending = true;
     }
 }
 
@@ -568,6 +590,21 @@ bool App::poll_events() {
 void App::frame(float dt) {
     handle_toggles();
     m_input.update(camera, dt);
+
+    /* Poll async viewshed completion */
+    if (m_viewshed_pending) {
+        auto tp0 = std::chrono::steady_clock::now();
+        poll_viewshed_recompute(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+        auto tp1 = std::chrono::steady_clock::now();
+        auto poll_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
+        if (poll_ms > 2) {
+            LOG_INFO("poll_viewshed_recompute took %lld ms", (long long)poll_ms);
+        }
+        if (!m_has_compute ||
+            m_gpu_viewshed.state() == ComputeState::IDLE) {
+            m_viewshed_pending = false;
+        }
+    }
 
     /* Update tile system */
     if (scene.use_tile_system) {

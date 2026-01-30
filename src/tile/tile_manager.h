@@ -6,11 +6,13 @@
 #include "tile/tile_data.h"
 #include "tile/hgt_provider.h"
 #include "tile/dsm_provider.h"
+#include "tile/async_loader.h"
 #include "util/math_util.h"
 #include <mesh3d/types.h>
 #include <memory>
 #include <functional>
 #include <vector>
+#include <chrono>
 
 namespace mesh3d {
 
@@ -72,6 +74,21 @@ public:
                                       const GeoProjection& proj,
                                       class GpuViewshed* gpu);
 
+    /* Start/stop the background I/O thread */
+    void start_loader();
+    void stop_loader();
+
+    /* Drain completed async tile results (budget-capped per frame) */
+    void drain_ready_tiles();
+
+    /* Async viewshed for tile mode (non-blocking) */
+    void kick_viewshed_gpu(const std::vector<NodeData>& nodes,
+                            const GeoProjection& proj,
+                            class GpuViewshed* gpu);
+    void poll_viewshed_gpu(const std::vector<NodeData>& nodes,
+                            const GeoProjection& proj,
+                            class GpuViewshed* gpu);
+
     /* Access for configuration */
     TileSelector& selector() { return m_selector; }
     TileTerrainBuilder& builder() { return m_builder; }
@@ -85,6 +102,7 @@ private:
     std::unique_ptr<DSMProvider> m_dsm_provider;
     ImagerySource m_imagery_source = ImagerySource::NONE;
 
+    AsyncLoader m_loader;
     TileSelector m_selector;
     TileTerrainBuilder m_builder;
     TileCache m_cache;
@@ -104,6 +122,14 @@ private:
 
     /* Camera-driven dynamic tile selection */
     void update_dynamic_tiles(double cam_lat, double cam_lon);
+
+    /* Tile-mode viewshed state: tracks per-tile GPU compute progress */
+    struct TileViewshedState {
+        bool active = false;
+        size_t current_tile = 0;
+        std::vector<TileCoord> tile_list;
+    };
+    TileViewshedState m_tile_vs;
 };
 
 } // namespace mesh3d

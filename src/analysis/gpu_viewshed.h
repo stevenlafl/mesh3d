@@ -10,6 +10,9 @@
 
 namespace mesh3d {
 
+/* Async compute state for non-blocking GPU viewshed */
+enum class ComputeState { IDLE, DISPATCHED, READY };
+
 class GpuViewshed {
 public:
     GpuViewshed() = default;
@@ -31,13 +34,31 @@ public:
     /* Set ITM parameters for ITM propagation model */
     void set_itm_params(const mesh3d_itm_params_t& params);
 
-    /* Compute viewshed for all nodes, merging results on GPU */
+    /* Compute viewshed for all nodes, merging results on GPU (blocking) */
     void compute_all(const std::vector<NodeData>& nodes);
 
-    /* Read back merged results to CPU arrays */
+    /* Async compute: dispatch GPU work and place a fence (non-blocking).
+       cpu_elevation is the same data passed to upload_elevation(), used to
+       look up node heights on the CPU side and avoid per-node glReadPixels
+       stalls that would serialize the dispatch loop. */
+    void compute_all_async(const std::vector<NodeData>& nodes,
+                           const float* cpu_elevation);
+
+    /* Check if GPU work is done (non-blocking). Returns current state. */
+    ComputeState poll_state();
+
+    /* Read back merged results to CPU arrays (blocking readback) */
     void read_back(std::vector<uint8_t>& vis,
                    std::vector<float>& signal,
                    std::vector<uint8_t>& overlap);
+
+    /* Read back after async compute completes, resets state to IDLE */
+    void read_back_async(std::vector<uint8_t>& vis,
+                         std::vector<float>& signal,
+                         std::vector<uint8_t>& overlap);
+
+    /* Current async state */
+    ComputeState state() const { return m_state; }
 
     /* Check if GL 4.3 compute shaders are available */
     static bool is_available();
@@ -73,6 +94,10 @@ private:
     bool m_initialized = false;
     bool m_has_itm = false;
     bool m_has_fresnel = false;
+
+    /* Async compute state */
+    ComputeState m_state = ComputeState::IDLE;
+    GLsync m_fence = nullptr;
 
     void create_textures(int rows, int cols);
     void destroy_textures();

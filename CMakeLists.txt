@@ -10,6 +10,7 @@ find_package(SDL2 REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(Threads REQUIRED)
 
 # GLM — prefer system, fall back to bundled
 find_package(glm QUIET)
@@ -55,6 +56,7 @@ set(LIB_SOURCES
     src/tile/tile_terrain_builder.cpp
     src/tile/tile_selector.cpp
     src/tile/tile_manager.cpp
+    src/tile/async_loader.cpp
     src/tile/disk_cache.cpp
     src/tile/hgt_provider.cpp
     src/tile/dsm_provider.cpp
@@ -68,7 +70,7 @@ target_include_directories(mesh3d_lib
     PRIVATE src ${GLM_INCLUDE_DIR}
 )
 target_link_libraries(mesh3d_lib
-    PUBLIC  glad stb OpenGL::GL CURL::libcurl ZLIB::ZLIB
+    PUBLIC  glad stb OpenGL::GL CURL::libcurl ZLIB::ZLIB Threads::Threads
 )
 target_compile_definitions(mesh3d_lib PRIVATE MESH3D_EXPORTS)
 

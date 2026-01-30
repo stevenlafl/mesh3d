@@ -1,6 +1,9 @@
 #pragma once
 #include <cstdio>
 #include <cstdarg>
+#include <string>
+#include <vector>
+#include <mutex>
 
 namespace mesh3d {
 
@@ -8,6 +11,14 @@ enum class LogLevel { Debug, Info, Warn, Error };
 
 void log_set_level(LogLevel level);
 void log_msg(LogLevel level, const char* fmt, ...);
+
+/* Ring buffer of recent log messages for HUD display */
+struct LogEntry {
+    LogLevel level;
+    std::string text;
+};
+
+std::vector<LogEntry> log_recent(int max_count = 3);
 
 } // namespace mesh3d
 

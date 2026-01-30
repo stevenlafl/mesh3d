@@ -1,5 +1,4 @@
 #include "ui/hud.h"
-#include "analysis/viewshed.h"
 #include "util/log.h"
 #include <glad/glad.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -177,6 +176,24 @@ void Hud::draw_text(const std::string& text, float x, float y,
     }
 }
 
+float Hud::measure_text(const std::string& text, float scale) {
+    float w = 0.0f;
+    for (char ch : text) {
+        if (ch < 32 || ch > 126) continue;
+        w += m_glyphs[(int)ch].advance * scale;
+    }
+    return w;
+}
+
+void Hud::draw_text_shadowed(const std::string& text, float x, float y,
+                              const glm::vec4& color, float scale,
+                              int screen_w, int screen_h) {
+    /* Dark shadow offset by 1px */
+    glm::vec4 shadow(0.0f, 0.0f, 0.0f, color.a * 0.8f);
+    draw_text(text, x + 1.0f, y + 1.0f, shadow, scale, screen_w, screen_h);
+    draw_text(text, x, y, color, scale, screen_w, screen_h);
+}
+
 void Hud::draw_crosshair(int screen_w, int screen_h) {
     float cx = screen_w * 0.5f;
     float cy = screen_h * 0.5f;
@@ -195,14 +212,16 @@ void Hud::draw_crosshair(int screen_w, int screen_h) {
 void Hud::draw_mode_indicator(int screen_w, int screen_h, bool node_placement_mode) {
     if (!node_placement_mode) return;
 
-    float pad = 10.0f;
     float banner_w = 240.0f;
     float banner_h = 30.0f;
     float bx = (screen_w - banner_w) * 0.5f;
-    float by = pad;
+    float by = 36.0f; // below top-left info text
 
     draw_rect(bx, by, banner_w, banner_h, glm::vec4(0.8f, 0.2f, 0.1f, 0.85f), screen_w, screen_h);
-    draw_text("NODE PLACEMENT", bx + 30.0f, by + 6.0f,
+    float tw = measure_text("NODE PLACEMENT", 1.0f);
+    float tx = bx + (banner_w - tw) * 0.5f;
+    float ty = by + (banner_h - m_line_height) * 0.5f;
+    draw_text("NODE PLACEMENT", tx, ty,
               glm::vec4(1, 1, 1, 1), 1.0f, screen_w, screen_h);
 }
 
@@ -408,6 +427,108 @@ void Hud::draw_menu(int screen_w, int screen_h, const Scene& scene,
     draw_text("[Quit]", lx, ly, glm::vec4(1.0f, 0.4f, 0.3f, 1.0f), 1.0f, screen_w, screen_h);
 }
 
+void Hud::draw_signal_scale(int screen_w, int screen_h, const Scene& scene) {
+    /* Only show when signal or link margin overlay is active */
+    if (scene.overlay_mode != MESH3D_OVERLAY_SIGNAL &&
+        scene.overlay_mode != MESH3D_OVERLAY_LINK_MARGIN)
+        return;
+
+    float pad = 10.0f;
+    float bar_w = 20.0f;
+    float bar_h = 200.0f;
+    float label_w = 60.0f;
+    float total_w = bar_w + label_w + 10.0f;
+    float bx = screen_w - pad - total_w;
+    float by = pad;
+
+    /* Background */
+    draw_rect(bx - 6, by - 6, total_w + 12, bar_h + 32,
+              glm::vec4(0.0f, 0.0f, 0.0f, 0.65f), screen_w, screen_h);
+
+    /* Title */
+    const char* title = (scene.overlay_mode == MESH3D_OVERLAY_SIGNAL) ? "dBm" : "Margin";
+    draw_text(title, bx, by, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f), 0.9f, screen_w, screen_h);
+    by += m_line_height + 2.0f;
+
+    /* Draw colored bar segments (top = strong, bottom = weak) */
+    int segments = 20;
+    float seg_h = bar_h / segments;
+
+    if (scene.overlay_mode == MESH3D_OVERLAY_SIGNAL) {
+        /* Signal: -80 (top, green) to -130 (bottom, red) */
+        for (int i = 0; i < segments; ++i) {
+            float t = 1.0f - static_cast<float>(i) / (segments - 1); // 1 at top, 0 at bottom
+            glm::vec3 c;
+            if (t < 0.5f) {
+                c = glm::mix(glm::vec3(1, 0, 0), glm::vec3(1, 1, 0), t * 2.0f);
+            } else {
+                c = glm::mix(glm::vec3(1, 1, 0), glm::vec3(0, 1, 0), (t - 0.5f) * 2.0f);
+            }
+            draw_rect(bx, by + i * seg_h, bar_w, seg_h + 1,
+                      glm::vec4(c, 1.0f), screen_w, screen_h);
+        }
+
+        /* Labels */
+        glm::vec4 lbl(0.85f, 0.85f, 0.85f, 1.0f);
+        float lx = bx + bar_w + 6.0f;
+        draw_text("-80",  lx, by, lbl, 0.85f, screen_w, screen_h);
+        draw_text("-105", lx, by + bar_h * 0.5f - m_line_height * 0.5f, lbl, 0.85f, screen_w, screen_h);
+        draw_text("-130", lx, by + bar_h - m_line_height, lbl, 0.85f, screen_w, screen_h);
+    } else {
+        /* Link margin: +20dB (top, green) to 0dB (bottom, red), <0 = black */
+        for (int i = 0; i < segments; ++i) {
+            float t = 1.0f - static_cast<float>(i) / (segments - 1);
+            float margin = t * 20.0f; // 0 to 20
+            glm::vec3 c;
+            if (margin < 10.0f) {
+                c = glm::mix(glm::vec3(1, 0, 0), glm::vec3(1, 1, 0), margin / 10.0f);
+            } else {
+                c = glm::mix(glm::vec3(1, 1, 0), glm::vec3(0, 1, 0), (margin - 10.0f) / 10.0f);
+            }
+            draw_rect(bx, by + i * seg_h, bar_w, seg_h + 1,
+                      glm::vec4(c, 1.0f), screen_w, screen_h);
+        }
+
+        glm::vec4 lbl(0.85f, 0.85f, 0.85f, 1.0f);
+        float lx = bx + bar_w + 6.0f;
+        draw_text("+20dB", lx, by, lbl, 0.85f, screen_w, screen_h);
+        draw_text("+10dB", lx, by + bar_h * 0.5f - m_line_height * 0.5f, lbl, 0.85f, screen_w, screen_h);
+        draw_text("0dB",   lx, by + bar_h - m_line_height, lbl, 0.85f, screen_w, screen_h);
+    }
+}
+
+void Hud::draw_console_log(int screen_w, int screen_h) {
+    auto entries = log_recent(3);
+    if (entries.empty()) return;
+
+    float pad = 10.0f;
+    float line_h = m_line_height;
+    float panel_h = entries.size() * line_h + 8.0f;
+    float panel_w = 500.0f;
+    float px = screen_w - pad - panel_w;
+    float py = screen_h - pad - panel_h;
+
+    /* Semi-transparent background */
+    draw_rect(px, py, panel_w, panel_h,
+              glm::vec4(0.0f, 0.0f, 0.0f, 0.5f), screen_w, screen_h);
+
+    float ty = py + 4.0f;
+    for (auto& e : entries) {
+        glm::vec4 color;
+        switch (e.level) {
+            case LogLevel::Error: color = glm::vec4(1.0f, 0.3f, 0.3f, 0.9f); break;
+            case LogLevel::Warn:  color = glm::vec4(1.0f, 0.8f, 0.2f, 0.9f); break;
+            case LogLevel::Info:  color = glm::vec4(0.7f, 0.7f, 0.7f, 0.7f); break;
+            default:              color = glm::vec4(0.5f, 0.5f, 0.5f, 0.6f); break;
+        }
+        /* Truncate long messages to fit panel */
+        std::string msg = e.text;
+        if (msg.size() > 70) msg = msg.substr(0, 67) + "...";
+        draw_text(msg, px + 6.0f, ty, color, 0.85f, screen_w, screen_h);
+        ty += line_h;
+    }
+}
+
 void Hud::render(int screen_w, int screen_h,
                   const Scene& scene, const Camera& cam,
                   const GeoProjection& proj,
@@ -434,6 +555,11 @@ void Hud::render(int screen_w, int screen_h,
             draw_controls(screen_w, screen_h);
         }
 
+        /* Signal strength color scale (top-right) */
+        draw_signal_scale(screen_w, screen_h, scene);
+        /* Console log (bottom-right) */
+        draw_console_log(screen_w, screen_h);
+
         /* Always show current position and overlay mode in top-left */
         auto ll = proj.unproject(cam.position.x, cam.position.z);
         char buf[256];
@@ -457,7 +583,7 @@ void Hud::render(int screen_w, int screen_h,
                      ll.lat, ll.lon, cam.position.y, cam.move_speed,
                      overlay_name, has_data ? "" : " (no data)");
         }
-        draw_text(buf, 10, 10, glm::vec4(0.7f, 0.7f, 0.7f, 0.8f), 1.0f, screen_w, screen_h);
+        draw_text_shadowed(buf, 10, 10, glm::vec4(0.85f, 0.85f, 0.85f, 0.95f), 1.0f, screen_w, screen_h);
     }
 
     /* Restore GL state */
@@ -527,13 +653,12 @@ int Hud::menu_activate(Scene& scene, Camera& cam, GeoProjection& proj) {
             nd.info.max_range_km = hp.max_range_km;
             scene.build_markers();
             scene.build_spheres();
-            recompute_all_viewsheds(scene, proj);
             LOG_INFO("Node %d device changed to %s (range %.0fkm)",
                      ni, hp.name, hp.max_range_km);
         }
         m_menu.device_select_node = -1;
         m_menu.editing_node = -1;
-        return 3;
+        return 4; // signal App to kick async viewshed recompute
     }
 
     // Lat field

@@ -34,4 +34,11 @@ void recompute_all_viewsheds(Scene& scene, const GeoProjection& proj);
 void recompute_all_viewsheds_gpu(Scene& scene, const GeoProjection& proj,
                                   GpuViewshed* gpu);
 
+/* Non-blocking async versions: kick dispatches GPU work, poll checks completion.
+   Call kick once, then poll each frame until it returns false (done). */
+void kick_viewshed_recompute(Scene& scene, const GeoProjection& proj,
+                              GpuViewshed* gpu);
+void poll_viewshed_recompute(Scene& scene, const GeoProjection& proj,
+                              GpuViewshed* gpu);
+
 } // namespace mesh3d

@@ -98,11 +98,17 @@ private:
                    const glm::vec4& color, float scale, int screen_w, int screen_h);
     void draw_rect(float x, float y, float w, float h,
                    const glm::vec4& color, int screen_w, int screen_h);
+    void draw_text_shadowed(const std::string& text, float x, float y,
+                            const glm::vec4& color, float scale, int screen_w, int screen_h);
+    float measure_text(const std::string& text, float scale);
     void draw_crosshair(int screen_w, int screen_h);
     void draw_controls(int screen_w, int screen_h);
     void draw_mode_indicator(int screen_w, int screen_h, bool node_placement_mode);
     void draw_menu(int screen_w, int screen_h, const Scene& scene,
                    const Camera& cam, const GeoProjection& proj);
+
+    void draw_signal_scale(int screen_w, int screen_h, const Scene& scene);
+    void draw_console_log(int screen_w, int screen_h);
 
     void upload_quad(float x, float y, float w, float h,
                      float u0, float v0, float u1, float v1);

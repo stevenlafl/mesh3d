@@ -60,6 +60,7 @@ private:
     bool m_hgt_mode = false;
     bool m_has_compute = false;
     GpuViewshed m_gpu_viewshed;
+    bool m_viewshed_pending = false;
 
     /* HUD state */
     bool m_show_controls = true;

@@ -12,6 +12,11 @@ uniform sampler2D uSatelliteTex;
 uniform vec3 uLightDir;
 uniform float uRxSensitivity; // dBm, for link margin overlay
 
+// GPU overlay textures (avoids mesh rebuild)
+uniform int uUseOverlayTex;
+uniform sampler2D uOverlayVisTex;  // R8 normalized: 0.0 or 1.0
+uniform sampler2D uOverlaySigTex;  // R32F: dBm value
+
 out vec4 FragColor;
 
 vec3 signalColor(float dbm) {
@@ -51,24 +56,32 @@ void main() {
 
     vec3 color = baseColor * lighting;
 
+    // Resolve overlay values — prefer GPU textures over vertex attributes
+    float viewshed_val = vViewshed;
+    float signal_val = vSignalDbm;
+    if (uUseOverlayTex > 0) {
+        viewshed_val = texture(uOverlayVisTex, vUV).r;
+        signal_val = texture(uOverlaySigTex, vUV).r;
+    }
+
     // Overlay
     if (uOverlayMode == 1) {
         // Viewshed: tint visible areas green
-        if (vViewshed > 0.5) {
+        if (viewshed_val > 0.5) {
             color = mix(color, vec3(0.0, 1.0, 0.0), 0.35);
         } else {
             color *= 0.5; // darken non-visible
         }
     } else if (uOverlayMode == 2) {
         // Signal strength heatmap
-        if (vSignalDbm > -900.0) {
-            vec3 sc = signalColor(vSignalDbm);
+        if (signal_val > -900.0) {
+            vec3 sc = signalColor(signal_val);
             color = mix(color, sc, 0.6);
         }
     } else if (uOverlayMode == 3) {
         // Link margin overlay
-        if (vSignalDbm > -900.0) {
-            float margin = vSignalDbm - uRxSensitivity;
+        if (signal_val > -900.0) {
+            float margin = signal_val - uRxSensitivity;
             vec3 mc;
             if (margin < 0.0) {
                 mc = vec3(0.0); // black — no link

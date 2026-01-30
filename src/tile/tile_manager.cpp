@@ -8,6 +8,7 @@
 #include "util/log.h"
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 
 namespace mesh3d {
 
@@ -72,18 +73,27 @@ void TileManager::ensure_elevation_tiles() {
 
     m_visible_elev = m_elev_provider->tiles_in_bounds(m_bounds, 0);
 
+    bool all_loaded = true;
     for (auto& coord : m_visible_elev) {
         if (m_cache.has(coord)) continue;
-
-        auto data = m_elev_provider->fetch_tile(coord);
-        if (!data) continue;
-
-        TileRenderable tr = m_builder.build(*data, m_proj);
-        m_cache.upload(std::move(tr));
-        LOG_DEBUG("Uploaded elevation tile z=%d x=%d y=%d", coord.z, coord.x, coord.y);
+        if (m_loader.is_pending(coord)) {
+            all_loaded = false;
+            continue;
+        }
+        m_loader.request(coord, m_elev_provider.get());
+        all_loaded = false;
     }
 
-    m_elev_loaded = true;
+    drain_ready_tiles();
+
+    /* Only mark as loaded once all tiles are in cache */
+    if (all_loaded) {
+        bool really_done = true;
+        for (auto& coord : m_visible_elev) {
+            if (!m_cache.has(coord)) { really_done = false; break; }
+        }
+        m_elev_loaded = really_done;
+    }
 }
 
 void TileManager::ensure_imagery_tiles() {
@@ -92,22 +102,12 @@ void TileManager::ensure_imagery_tiles() {
 
     m_visible_imagery = m_selector.select(m_bounds);
 
-    for (auto& coord : m_visible_imagery) {
-        /* Check if we already have imagery for this tile in cache */
-        /* Imagery tiles are separate from elevation tiles — we merge them */
-        /* For single-tile elevation mode, we apply imagery as texture on the elevation tile */
-    }
-
-    /* For each elevation tile, try to apply imagery texture */
+    /* Composite imagery for tiles that still need textures.
+       composite_imagery_for_tile calls fetch_tile synchronously per imagery
+       sub-tile; the provider's disk cache prevents redundant downloads. */
     for (auto& elev_coord : m_visible_elev) {
         TileRenderable* tr = m_cache.get(elev_coord);
-        if (!tr) continue;
-
-        /* If tile already has a texture, skip (already merged) */
-        if (tr->texture.valid()) continue;
-
-        /* Fetch the best imagery tile covering this elevation tile's bounds */
-        /* For single-tile mode, we composite all imagery tiles into one texture */
+        if (!tr || tr->texture.valid()) continue;
         composite_imagery_for_tile(tr);
     }
 }
@@ -173,11 +173,36 @@ void TileManager::composite_imagery_for_tile(TileRenderable* tr) {
 
     if (fetched == 0) return;
 
-    LOG_INFO("Composited %d/%zu imagery tiles (%dx%d px)",
-             fetched, imagery_coords.size(), comp_w, comp_h);
+    /* Crop composite to match the elevation tile bounds exactly.
+       The composite covers the full slippy map tile grid (min_x..max_x+1,
+       min_y..max_y+1) which is typically larger than the HGT tile.
+       Use fractional tile coordinates to find the pixel region. */
+    double fx0 = lon_to_tile_x_frac(tr->bounds.min_lon, zoom) - min_x;
+    double fx1 = lon_to_tile_x_frac(tr->bounds.max_lon, zoom) - min_x;
+    double fy0 = lat_to_tile_y_frac(tr->bounds.max_lat, zoom) - min_y; // north = top
+    double fy1 = lat_to_tile_y_frac(tr->bounds.min_lat, zoom) - min_y; // south = bottom
+
+    int cx0 = std::max(0, static_cast<int>(std::round(fx0 * tile_px)));
+    int cy0 = std::max(0, static_cast<int>(std::round(fy0 * tile_px)));
+    int cx1 = std::min(comp_w, static_cast<int>(std::round(fx1 * tile_px)));
+    int cy1 = std::min(comp_h, static_cast<int>(std::round(fy1 * tile_px)));
+    int crop_w = cx1 - cx0;
+    int crop_h = cy1 - cy0;
+
+    if (crop_w <= 0 || crop_h <= 0) return;
+
+    std::vector<uint8_t> cropped(crop_w * crop_h * 4);
+    for (int row = 0; row < crop_h; ++row) {
+        int src = ((cy0 + row) * comp_w + cx0) * 4;
+        int dst = row * crop_w * 4;
+        std::memcpy(&cropped[dst], &composite[src], crop_w * 4);
+    }
+
+    LOG_INFO("Composited %d/%zu imagery tiles, cropped %dx%d -> %dx%d px",
+             fetched, imagery_coords.size(), comp_w, comp_h, crop_w, crop_h);
 
     Texture tex;
-    tex.load_rgba(composite.data(), comp_w, comp_h);
+    tex.load_rgba(cropped.data(), crop_w, crop_h);
     tr->texture = std::move(tex);
 }
 
@@ -227,23 +252,18 @@ void TileManager::update(const Camera& cam, const GeoProjection& proj) {
 void TileManager::update_dynamic_tiles(double cam_lat, double cam_lon) {
     auto needed = m_hgt_provider->tiles_in_view(cam_lat, cam_lon);
 
-    /* Don't evict — let LRU cache handle expiry naturally.
-       This prevents thrashing when the camera oscillates near a tile edge. */
-
-    /* Fetch and upload new tiles */
+    /* Enqueue missing tiles to async loader */
     for (auto& coord : needed) {
         if (m_cache.has(coord)) {
             m_cache.touch(coord);
             continue;
         }
-
-        auto data = m_hgt_provider->fetch_tile(coord);
-        if (!data) continue;
-
-        TileRenderable tr = m_builder.build(*data, m_proj);
-        m_cache.upload(std::move(tr));
-        LOG_INFO("Uploaded HGT tile %s", HgtProvider::coord_to_filename(coord).c_str());
+        if (m_loader.is_pending(coord)) continue;
+        m_loader.request(coord, m_hgt_provider.get());
     }
+
+    /* Drain completed tiles from the loader */
+    drain_ready_tiles();
 
     m_visible_elev = needed;
     m_elev_loaded = true;
@@ -316,6 +336,21 @@ float TileManager::get_elevation_at(float world_x, float world_z,
     return h0 + fr * (h1 - h0);
 }
 
+/* Filter nodes to only those within the tile's geographic bounds.
+   Nodes outside the tile get clamped to the edge by the compute shader,
+   producing false signal strips along tile boundaries. */
+static std::vector<NodeData> nodes_in_bounds(const std::vector<NodeData>& nodes,
+                                              const mesh3d_bounds_t& bounds) {
+    std::vector<NodeData> result;
+    for (auto& nd : nodes) {
+        if (nd.info.lat >= bounds.min_lat && nd.info.lat <= bounds.max_lat &&
+            nd.info.lon >= bounds.min_lon && nd.info.lon <= bounds.max_lon) {
+            result.push_back(nd);
+        }
+    }
+    return result;
+}
+
 void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
                                            const GeoProjection& proj) {
     /* Iterate all cached tiles, compute viewshed per tile, rebuild mesh */
@@ -327,8 +362,10 @@ void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
         tr.viewshed.assign(total, 0);
         tr.signal.assign(total, -999.0f);
 
-        /* Compute per-node viewshed on this tile's elevation grid */
-        for (auto& nd : nodes) {
+        /* Compute per-node viewshed on this tile's elevation grid
+           (only for nodes within this tile's bounds) */
+        auto tile_nodes = nodes_in_bounds(nodes, tr.bounds);
+        for (auto& nd : tile_nodes) {
             std::vector<uint8_t> vis;
             std::vector<float> sig;
             compute_viewshed(tr.elevation.data(), tr.elev_rows, tr.elev_cols,
@@ -367,9 +404,10 @@ void TileManager::apply_viewshed_overlays_gpu(const std::vector<NodeData>& nodes
         int total = tr.elev_rows * tr.elev_cols;
 
         /* Upload tile elevation and compute on GPU */
+        auto tile_nodes = nodes_in_bounds(nodes, tr.bounds);
         gpu->upload_elevation(tr.elevation.data(), tr.elev_rows, tr.elev_cols);
         gpu->set_grid_params(tr.bounds, tr.elev_rows, tr.elev_cols);
-        gpu->compute_all(nodes);
+        gpu->compute_all(tile_nodes);
 
         std::vector<uint8_t> overlap;
         gpu->read_back(tr.viewshed, tr.signal, overlap);
@@ -383,11 +421,118 @@ void TileManager::apply_viewshed_overlays_gpu(const std::vector<NodeData>& nodes
     LOG_INFO("Applied GPU viewshed overlays to cached tiles for %zu nodes", nodes.size());
 }
 
+void TileManager::start_loader() {
+    m_loader.start();
+}
+
+void TileManager::stop_loader() {
+    m_loader.stop();
+}
+
+void TileManager::drain_ready_tiles() {
+    auto t0 = std::chrono::steady_clock::now();
+    constexpr auto BUDGET = std::chrono::milliseconds(4);
+
+    TileData data;
+    while (m_loader.poll_result(data)) {
+        if (data.coord.z == -1 || !data.elevation.empty()) {
+            /* Skip if already in GPU cache (race guard) */
+            if (m_cache.has(data.coord)) {
+                LOG_DEBUG("Async: tile z=%d x=%d y=%d already in cache, skipping",
+                          data.coord.z, data.coord.x, data.coord.y);
+            } else {
+                TileRenderable tr = m_builder.build(data, m_proj);
+                m_cache.upload(std::move(tr));
+                LOG_INFO("Async: uploaded tile z=%d x=%d y=%d",
+                         data.coord.z, data.coord.x, data.coord.y);
+            }
+        }
+
+        if (std::chrono::steady_clock::now() - t0 > BUDGET) break;
+    }
+}
+
+void TileManager::kick_viewshed_gpu(const std::vector<NodeData>& nodes,
+                                      const GeoProjection& proj,
+                                      GpuViewshed* gpu) {
+    if (!gpu) return;
+
+    /* Collect all tiles that have elevation data */
+    m_tile_vs.tile_list.clear();
+    m_cache.for_each([&](const TileRenderable& tr) {
+        if (!tr.elevation.empty() && tr.elev_rows >= 2 && tr.elev_cols >= 2)
+            m_tile_vs.tile_list.push_back(tr.coord);
+    });
+
+    if (m_tile_vs.tile_list.empty()) return;
+
+    m_tile_vs.current_tile = 0;
+    m_tile_vs.active = true;
+
+    /* Dispatch first tile — only with nodes that fall within it */
+    TileRenderable* tr = m_cache.get(m_tile_vs.tile_list[0]);
+    if (tr) {
+        auto tile_nodes = nodes_in_bounds(nodes, tr->bounds);
+        gpu->upload_elevation(tr->elevation.data(), tr->elev_rows, tr->elev_cols);
+        gpu->set_grid_params(tr->bounds, tr->elev_rows, tr->elev_cols);
+        gpu->compute_all_async(tile_nodes, tr->elevation.data());
+    }
+}
+
+void TileManager::poll_viewshed_gpu(const std::vector<NodeData>& nodes,
+                                      const GeoProjection& proj,
+                                      GpuViewshed* gpu) {
+    if (!gpu || !m_tile_vs.active) return;
+    if (gpu->poll_state() != ComputeState::READY) return;
+
+    /* Read back results for current tile and upload as overlay textures */
+    size_t idx = m_tile_vs.current_tile;
+    if (idx < m_tile_vs.tile_list.size()) {
+        TileRenderable* tr = m_cache.get(m_tile_vs.tile_list[idx]);
+        if (tr) {
+            auto t0 = std::chrono::steady_clock::now();
+            std::vector<uint8_t> overlap;
+            gpu->read_back_async(tr->viewshed, tr->signal, overlap);
+            auto t1 = std::chrono::steady_clock::now();
+
+            /* Upload as GPU overlay textures (skips full mesh rebuild) */
+            tr->upload_overlay_textures(tr->viewshed.data(), tr->signal.data(),
+                                         tr->elev_rows, tr->elev_cols);
+            auto t2 = std::chrono::steady_clock::now();
+
+            auto ms = [](auto a, auto b) {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+            };
+            LOG_INFO("poll_viewshed_gpu tile %zu: readback=%lldms upload=%lldms",
+                     idx, (long long)ms(t0,t1), (long long)ms(t1,t2));
+        }
+    }
+
+    /* Advance to next tile */
+    m_tile_vs.current_tile++;
+    if (m_tile_vs.current_tile < m_tile_vs.tile_list.size()) {
+        TileRenderable* tr = m_cache.get(m_tile_vs.tile_list[m_tile_vs.current_tile]);
+        if (tr) {
+            auto tile_nodes = nodes_in_bounds(nodes, tr->bounds);
+            gpu->upload_elevation(tr->elevation.data(), tr->elev_rows, tr->elev_cols);
+            gpu->set_grid_params(tr->bounds, tr->elev_rows, tr->elev_cols);
+            gpu->compute_all_async(tile_nodes, tr->elevation.data());
+        }
+    } else {
+        /* All tiles done */
+        m_tile_vs.active = false;
+        LOG_INFO("Async tile viewshed complete for %zu tiles, %zu nodes",
+                 m_tile_vs.tile_list.size(), nodes.size());
+    }
+}
+
 void TileManager::clear() {
+    m_loader.stop();
     m_cache.clear();
     m_elev_loaded = false;
     m_visible_elev.clear();
     m_visible_imagery.clear();
+    m_tile_vs.active = false;
 }
 
 } // namespace mesh3d

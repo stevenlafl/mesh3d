@@ -68,6 +68,19 @@ inline mesh3d_bounds_t tile_bounds(const TileCoord& tc) {
     return b;
 }
 
+/* Fractional tile coordinate from latitude (for sub-tile pixel mapping) */
+inline double lat_to_tile_y_frac(double lat, int z) {
+    double lat_rad = lat * M_PI / 180.0;
+    double n = static_cast<double>(1 << z);
+    return (1.0 - std::log(std::tan(lat_rad) + 1.0 / std::cos(lat_rad)) / M_PI) / 2.0 * n;
+}
+
+/* Fractional tile coordinate from longitude (for sub-tile pixel mapping) */
+inline double lon_to_tile_x_frac(double lon, int z) {
+    double n = static_cast<double>(1 << z);
+    return (lon + 180.0) / 360.0 * n;
+}
+
 /* Get all tile coordinates covering a bounding box at a given zoom level */
 inline std::vector<TileCoord> bounds_to_tile_range(const mesh3d_bounds_t& bounds, int zoom) {
     int x_min = lon_to_tile_x(bounds.min_lon, zoom);
