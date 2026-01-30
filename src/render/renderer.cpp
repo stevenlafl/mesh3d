@@ -2,6 +2,7 @@
 #include "scene/scene.h"
 #include "tile/tile_manager.h"
 #include "camera/camera.h"
+#include "ui/hud.h"
 #include "util/log.h"
 #include <algorithm>
 #include <glm/gtc/matrix_transform.hpp>
@@ -48,12 +49,25 @@ void Renderer::setup_common_uniforms(Shader& s, const Camera& cam, float aspect)
     s.set_vec3("uCameraPos", cam.position);
 }
 
-void Renderer::render(const Scene& scene, const Camera& cam, float aspect) {
+void Renderer::render(const Scene& scene, const Camera& cam, float aspect,
+                       int screen_w, int screen_h,
+                       Hud* hud, const GeoProjection* proj,
+                       bool node_placement_mode, bool show_controls) {
     glClearColor(0.12f, 0.14f, 0.18f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     opaque_pass(scene, cam, aspect);
     transparent_pass(scene, cam, aspect);
+    hud_pass(scene, cam, screen_w, screen_h, hud, proj, node_placement_mode, show_controls);
+}
+
+void Renderer::hud_pass(const Scene& scene, const Camera& cam,
+                         int screen_w, int screen_h,
+                         Hud* hud, const GeoProjection* proj,
+                         bool node_placement_mode, bool show_controls) {
+    if (!hud || !proj) return;
+    hud->render(screen_w, screen_h, scene, cam, *proj,
+                node_placement_mode, show_controls);
 }
 
 void Renderer::opaque_pass(const Scene& scene, const Camera& cam, float aspect) {

@@ -13,6 +13,10 @@ TileRenderable TileTerrainBuilder::build(const TileData& data, const GeoProjecti
 
     if (data.elev_rows >= 2 && data.elev_cols >= 2 && !data.elevation.empty()) {
         tr.mesh = build_mesh(data, proj);
+        /* Retain CPU-side elevation for runtime queries */
+        tr.elevation = data.elevation;
+        tr.elev_rows = data.elev_rows;
+        tr.elev_cols = data.elev_cols;
     }
 
     if (!data.imagery.empty() && data.img_width > 0 && data.img_height > 0) {
@@ -31,6 +35,19 @@ Mesh TileTerrainBuilder::build_mesh(const TileData& data, const GeoProjection& p
     td.elevation_scale = elevation_scale;
     td.viewshed = data.viewshed.empty() ? nullptr : data.viewshed.data();
     td.signal = data.signal.empty() ? nullptr : data.signal.data();
+
+    return build_terrain_mesh(td, proj);
+}
+
+Mesh TileTerrainBuilder::rebuild_mesh(const TileRenderable& tr, const GeoProjection& proj) const {
+    TerrainBuildData td;
+    td.elevation = tr.elevation.data();
+    td.rows = tr.elev_rows;
+    td.cols = tr.elev_cols;
+    td.bounds = tr.bounds;
+    td.elevation_scale = elevation_scale;
+    td.viewshed = tr.viewshed.empty() ? nullptr : tr.viewshed.data();
+    td.signal = tr.signal.empty() ? nullptr : tr.signal.data();
 
     return build_terrain_mesh(td, proj);
 }

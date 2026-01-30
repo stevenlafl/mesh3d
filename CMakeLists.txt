@@ -43,6 +43,8 @@ set(LIB_SOURCES
     src/camera/camera.cpp
     src/camera/input.cpp
     src/cabi/cabi.cpp
+    src/ui/hud.cpp
+    src/analysis/viewshed.cpp
     src/util/log.cpp
     src/tile/tile_provider.cpp
     src/tile/single_tile_provider.cpp

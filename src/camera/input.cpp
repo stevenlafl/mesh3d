@@ -23,8 +23,47 @@ void InputHandler::process_event(const SDL_Event& ev, Camera& cam) {
         }
         break;
 
+    case SDL_TEXTINPUT:
+        if (m_menu_open && ev.text.text[0]) {
+            m_text_char = ev.text.text[0];
+        }
+        break;
+
     case SDL_KEYDOWN:
-        if (ev.key.repeat) break;
+        if (ev.key.repeat) {
+            /* Allow repeats for menu text input keys */
+            if (m_menu_open) {
+                switch (ev.key.keysym.sym) {
+                    case SDLK_BACKSPACE: m_backspace = true; break;
+                    case SDLK_UP:    m_arrow_up = true; break;
+                    case SDLK_DOWN:  m_arrow_down = true; break;
+                    case SDLK_LEFT:  m_arrow_left = true; break;
+                    case SDLK_RIGHT: m_arrow_right = true; break;
+                    default: break;
+                }
+            }
+            break;
+        }
+
+        if (m_menu_open) {
+            /* Menu-specific input */
+            switch (ev.key.keysym.sym) {
+                case SDLK_ESCAPE:   m_escape = true; break;
+                case SDLK_RETURN:
+                case SDLK_KP_ENTER: m_enter = true; break;
+                case SDLK_UP:       m_arrow_up = true; break;
+                case SDLK_DOWN:     m_arrow_down = true; break;
+                case SDLK_LEFT:     m_arrow_left = true; break;
+                case SDLK_RIGHT:    m_arrow_right = true; break;
+                case SDLK_BACKSPACE:m_backspace = true; break;
+                case SDLK_DELETE:   m_delete_key = true; break;
+                case SDLK_TAB:      m_arrow_down = true; break; // tab acts as down
+                default: break;
+            }
+            break; // don't process camera keys when menu is open
+        }
+
+        /* Normal (non-menu) input */
         switch (ev.key.keysym.sym) {
             case SDLK_w: m_fwd   = true; break;
             case SDLK_s: m_back  = true; break;
@@ -36,16 +75,17 @@ void InputHandler::process_event(const SDL_Event& ev, Camera& cam) {
             case SDLK_RSHIFT: m_sprint = true; break;
             case SDLK_TAB:    m_tab  = true; break;
             case SDLK_1:      m_key1 = true; break;
-            case SDLK_2:      m_key2 = true; break;
             case SDLK_3:      m_key3 = true; break;
             case SDLK_t:      m_keyT = true; break;
             case SDLK_f:      m_keyF = true; break;
+            case SDLK_n:      m_keyN = true; break;
+            case SDLK_h:      m_keyH = true; break;
+            case SDLK_DELETE:  m_delete_key = true; break;
             case SDLK_ESCAPE:
+                m_escape = true;
                 if (m_mouse_captured) {
                     m_mouse_captured = false;
                     SDL_SetRelativeMouseMode(SDL_FALSE);
-                } else {
-                    m_quit = true;
                 }
                 break;
         }
@@ -65,26 +105,36 @@ void InputHandler::process_event(const SDL_Event& ev, Camera& cam) {
         break;
 
     case SDL_MOUSEBUTTONDOWN:
-        if (ev.button.button == SDL_BUTTON_RIGHT && !m_mouse_captured) {
-            m_mouse_captured = true;
-            SDL_SetRelativeMouseMode(SDL_TRUE);
+        if (m_menu_open) break; // ignore clicks when menu open
+        if (ev.button.button == SDL_BUTTON_LEFT) {
+            m_left_click = true;
+        } else if (ev.button.button == SDL_BUTTON_RIGHT) {
+            if (!m_mouse_captured) {
+                m_mouse_captured = true;
+                SDL_SetRelativeMouseMode(SDL_TRUE);
+            }
+            m_right_click = true;
         }
         break;
 
     case SDL_MOUSEMOTION:
-        if (m_mouse_captured && m_focused) {
+        if (m_mouse_captured && m_focused && !m_menu_open) {
             cam.rotate(static_cast<float>(ev.motion.xrel),
                       -static_cast<float>(ev.motion.yrel));
         }
         break;
 
     case SDL_MOUSEWHEEL:
-        cam.zoom(static_cast<float>(ev.motion.x));
+        if (!m_menu_open) {
+            cam.zoom(static_cast<float>(ev.motion.x));
+        }
         break;
     }
 }
 
 void InputHandler::update(Camera& cam, float dt) {
+    if (m_menu_open) return; // suppress camera movement when menu open
+
     if (m_fwd)   cam.move_forward( dt, m_sprint);
     if (m_back)  cam.move_forward(-dt, m_sprint);
     if (m_right) cam.move_right( dt, m_sprint);

@@ -4,6 +4,7 @@
 #include "tile/tile_terrain_builder.h"
 #include "tile/tile_selector.h"
 #include "tile/tile_data.h"
+#include "tile/hgt_provider.h"
 #include "util/math_util.h"
 #include <mesh3d/types.h>
 #include <memory>
@@ -13,7 +14,7 @@
 namespace mesh3d {
 
 class Camera;
-class HgtProvider;
+struct NodeData;
 
 enum class ImagerySource { SATELLITE, STREET, NONE };
 
@@ -51,6 +52,15 @@ public:
 
     bool has_terrain() const;
     bool has_hgt_provider() const { return m_hgt_provider != nullptr; }
+
+    /* Query terrain elevation at a world position.
+       Returns interpolated height in meters, or 0 if no data available. */
+    float get_elevation_at(float world_x, float world_z, const GeoProjection& proj) const;
+
+    /* Compute viewshed overlays on all cached tiles for the given nodes,
+       then rebuild tile meshes with the overlay data baked in. */
+    void apply_viewshed_overlays(const std::vector<NodeData>& nodes,
+                                  const GeoProjection& proj);
 
     /* Access for configuration */
     TileSelector& selector() { return m_selector; }

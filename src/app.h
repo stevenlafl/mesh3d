@@ -1,10 +1,12 @@
 #pragma once
 #include <SDL2/SDL.h>
 #include <string>
+#include <optional>
 #include "scene/scene.h"
 #include "render/renderer.h"
 #include "camera/camera.h"
 #include "camera/input.h"
+#include "ui/hud.h"
 #include "util/math_util.h"
 #include <mesh3d/types.h>
 
@@ -48,11 +50,30 @@ private:
     int m_width = 1280, m_height = 720;
 
     InputHandler m_input;
+    Hud          m_hud;
     std::string  m_shader_dir;
     GeoProjection m_proj;
     bool m_hgt_mode = false;
 
+    /* HUD state */
+    bool m_show_controls = true;
+    bool m_node_placement_mode = false;
+
     void handle_toggles();
+    void handle_menu_input();
+    void handle_node_placement();
+
+    /* Terrain raycast from camera center */
+    std::optional<glm::vec3> raycast_terrain();
+
+    /* Place a node at a world position */
+    void place_node_at(const glm::vec3& world_pos);
+
+    /* Delete nearest node to a world position */
+    void delete_nearest_node(const glm::vec3& world_pos);
+
+    /* Find font path (search relative to exe) */
+    std::string find_font_path();
 };
 
 /* Global app instance */

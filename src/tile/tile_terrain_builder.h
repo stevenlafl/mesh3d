@@ -19,6 +19,9 @@ public:
     /* Build mesh-only from elevation data (no imagery) */
     Mesh build_mesh(const TileData& data, const GeoProjection& proj) const;
 
+    /* Rebuild mesh from a TileRenderable's retained elevation + overlay data */
+    Mesh rebuild_mesh(const TileRenderable& tr, const GeoProjection& proj) const;
+
     /* Upload imagery data as texture */
     Texture build_texture(const TileData& data) const;
 };

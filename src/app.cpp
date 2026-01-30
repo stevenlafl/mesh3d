@@ -1,16 +1,37 @@
 #include "app.h"
 #include "tile/hgt_provider.h"
 #include "tile/url_tile_provider.h"
+#include "ui/hardware_profiles.h"
+#include "analysis/viewshed.h"
 #include "util/math_util.h"
+#include "util/color.h"
 #include "util/log.h"
+#include "scene/node_marker.h"
+#include "scene/signal_sphere.h"
 #include <glad/glad.h>
 #include <cstring>
 #include <filesystem>
+#include <cmath>
 
 namespace mesh3d {
 
 static App g_app;
 App& app() { return g_app; }
+
+std::string App::find_font_path() {
+    namespace fs = std::filesystem;
+    /* Search relative to shader dir, then common locations */
+    for (auto& candidate : {
+        "assets/fonts/LiberationMono-Regular.ttf",
+        "../assets/fonts/LiberationMono-Regular.ttf",
+        "../../assets/fonts/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+    }) {
+        if (fs::exists(candidate)) return candidate;
+    }
+    return "assets/fonts/LiberationMono-Regular.ttf"; // fallback
+}
 
 bool App::init(int width, int height, const char* title) {
     m_width = width;
@@ -76,6 +97,12 @@ bool App::init(int width, int height, const char* title) {
         return false;
     }
 
+    /* Initialize HUD */
+    std::string font_path = find_font_path();
+    if (!m_hud.init(m_shader_dir, font_path)) {
+        LOG_WARN("HUD init failed (font: %s) — HUD disabled", font_path.c_str());
+    }
+
     /* Default camera position */
     camera.position = glm::vec3(0, 500, 200);
     camera.rotate(0, 0); // force vector update
@@ -85,6 +112,7 @@ bool App::init(int width, int height, const char* title) {
 }
 
 void App::shutdown() {
+    m_hud.shutdown();
     scene.clear();
     if (m_gl_ctx) { SDL_GL_DeleteContext(m_gl_ctx); m_gl_ctx = nullptr; }
     if (m_window) { SDL_DestroyWindow(m_window); m_window = nullptr; }
@@ -126,6 +154,7 @@ bool App::set_terrain(const mesh3d_grid_f32_t& grid, const mesh3d_bounds_t& boun
     scene.grid_rows = grid.rows;
     scene.grid_cols = grid.cols;
     scene.elevation.assign(grid.data, grid.data + grid.rows * grid.cols);
+    m_proj.init(bounds);
     scene.build_terrain();
     scene.build_flat_plane();
     return true;
@@ -195,15 +224,295 @@ void App::rebuild_scene() {
 }
 
 void App::handle_toggles() {
+    /* ESC handling — menu toggle or exit node placement */
+    if (m_input.consume_escape()) {
+        if (m_node_placement_mode) {
+            m_node_placement_mode = false;
+            LOG_INFO("Exited node placement mode");
+        } else if (m_hud.menu().open) {
+            m_hud.menu().open = false;
+            m_input.set_menu_open(false);
+            SDL_StopTextInput();
+            LOG_INFO("Menu closed");
+        } else {
+            m_hud.menu().open = true;
+            m_input.set_menu_open(true);
+            SDL_StartTextInput();
+            LOG_INFO("Menu opened");
+        }
+    }
+
+    /* Don't process normal toggles when menu is open */
+    if (m_hud.menu().open) {
+        handle_menu_input();
+        return;
+    }
+
     if (m_input.consume_tab()) {
         set_render_mode(scene.render_mode == MESH3D_MODE_TERRAIN
                         ? MESH3D_MODE_FLAT : MESH3D_MODE_TERRAIN);
     }
-    if (m_input.consume_key1()) set_overlay_mode(MESH3D_OVERLAY_VIEWSHED);
-    if (m_input.consume_key2()) set_overlay_mode(MESH3D_OVERLAY_SIGNAL);
+    if (m_input.consume_key1()) {
+        /* Cycle overlay: none -> viewshed -> signal -> none */
+        int next = (static_cast<int>(scene.overlay_mode) + 1) % 3;
+        set_overlay_mode(static_cast<mesh3d_overlay_mode_t>(next));
+    }
     if (m_input.consume_key3()) cycle_imagery_source();
     if (m_input.consume_keyT()) toggle_signal_spheres();
     if (m_input.consume_keyF()) toggle_wireframe();
+
+    if (m_input.consume_keyH()) {
+        m_show_controls = !m_show_controls;
+        LOG_INFO("Controls display: %s", m_show_controls ? "ON" : "OFF");
+    }
+
+    if (m_input.consume_keyN()) {
+        m_node_placement_mode = !m_node_placement_mode;
+        if (m_node_placement_mode) {
+            /* Drain any stale click events so mouselook clicks
+               don't get misinterpreted as placement actions. */
+            m_input.consume_left_click();
+            m_input.consume_right_click();
+            m_input.consume_delete_key();
+        }
+        LOG_INFO("Node placement mode: %s", m_node_placement_mode ? "ON" : "OFF");
+    }
+
+    /* Node placement interactions */
+    if (m_node_placement_mode) {
+        handle_node_placement();
+    }
+}
+
+void App::handle_menu_input() {
+    /* Text input */
+    char tc = m_input.consume_text_char();
+    if (tc) m_hud.menu_text_input(tc);
+
+    if (m_input.consume_backspace()) m_hud.menu_backspace();
+    if (m_input.consume_arrow_up()) m_hud.menu_navigate(-1);
+    if (m_input.consume_arrow_down()) m_hud.menu_navigate(1);
+    if (m_input.consume_arrow_left()) m_hud.menu_device_left();
+    if (m_input.consume_arrow_right()) m_hud.menu_device_right();
+
+    if (m_input.consume_enter()) {
+        int result = m_hud.menu_activate(scene, camera, m_proj);
+        if (result == 1) {
+            // Resume
+            m_hud.menu().open = false;
+            m_input.set_menu_open(false);
+            SDL_StopTextInput();
+            LOG_INFO("Menu: resumed");
+        } else if (result == 2) {
+            // Quit
+            LOG_INFO("Menu: quit requested");
+            m_hud.menu().open = false;
+            m_input.set_menu_open(false);
+            SDL_StopTextInput();
+            // Push a quit event
+            SDL_Event quit_ev;
+            quit_ev.type = SDL_QUIT;
+            SDL_PushEvent(&quit_ev);
+        }
+    }
+
+    /* Delete node from menu */
+    if (m_input.consume_delete_key()) {
+        auto& menu = m_hud.menu();
+        int node_idx = -1;
+        if (m_hud.is_node_field(menu.focused_field, scene, node_idx)) {
+            if (node_idx >= 0 && node_idx < (int)scene.nodes.size()) {
+                scene.nodes.erase(scene.nodes.begin() + node_idx);
+                scene.build_markers();
+                scene.build_spheres();
+                recompute_all_viewsheds(scene, m_proj);
+                menu.editing_node = -1;
+                menu.device_select_node = -1;
+                LOG_INFO("Deleted node %d from menu", node_idx);
+            }
+        }
+    }
+}
+
+void App::handle_node_placement() {
+    if (m_input.consume_left_click()) {
+        auto hit = raycast_terrain();
+        if (hit) {
+            place_node_at(*hit);
+        }
+    }
+    if (m_input.consume_right_click()) {
+        // Right-click in placement mode: delete nearest node
+        // (only if not captured for mouselook — but we consume the flag anyway)
+        auto hit = raycast_terrain();
+        if (hit) {
+            delete_nearest_node(*hit);
+        }
+    }
+    if (m_input.consume_delete_key()) {
+        auto hit = raycast_terrain();
+        if (hit) {
+            delete_nearest_node(*hit);
+        }
+    }
+}
+
+std::optional<glm::vec3> App::raycast_terrain() {
+    /* Ray march along camera front direction, sampling elevation grid */
+    if (scene.elevation.empty() || scene.grid_rows < 2 || scene.grid_cols < 2) {
+        /* No scene-level grid — sample from tile system */
+        glm::vec3 origin = camera.position;
+        glm::vec3 dir = camera.front();
+        if (dir.y >= 0) return std::nullopt; // looking up
+
+        /* Estimate max distance from a ground-plane intersection */
+        float t_ground = -origin.y / dir.y;
+        if (t_ground < 0) return std::nullopt;
+        float max_dist = std::min(t_ground * 2.0f, 50000.0f);
+
+        float step = 10.0f;
+        for (float t = 0; t < max_dist; t += step) {
+            glm::vec3 p = origin + dir * t;
+            float terrain_h = scene.tile_manager.get_elevation_at(
+                p.x, p.z, m_proj);
+            if (p.y <= terrain_h) {
+                /* Binary search refinement */
+                float lo = std::max(0.0f, t - step);
+                float hi = t;
+                for (int i = 0; i < 10; ++i) {
+                    float mid = (lo + hi) * 0.5f;
+                    glm::vec3 mp = origin + dir * mid;
+                    float mh = scene.tile_manager.get_elevation_at(
+                        mp.x, mp.z, m_proj);
+                    if (mp.y <= mh) hi = mid;
+                    else lo = mid;
+                }
+                return origin + dir * ((lo + hi) * 0.5f);
+            }
+        }
+        return std::nullopt;
+    }
+
+    /* Grid-based elevation sampling */
+    glm::vec3 origin = camera.position;
+    glm::vec3 dir = camera.front();
+    if (dir.y >= 0) return std::nullopt;
+
+    float width_m = m_proj.width_m(scene.bounds);
+    float height_m = m_proj.height_m(scene.bounds);
+    float half_w = width_m * 0.5f;
+    float half_h = height_m * 0.5f;
+
+    float step = std::min(width_m, height_m) / std::max(scene.grid_rows, scene.grid_cols);
+    step = std::max(step, 1.0f);
+    float max_dist = 100000.0f;
+
+    for (float t = 0; t < max_dist; t += step) {
+        glm::vec3 p = origin + dir * t;
+
+        /* Convert world XZ to grid coords */
+        float gx = (p.x + half_w) / width_m * (scene.grid_cols - 1);
+        float gz = (p.z + half_h) / height_m * (scene.grid_rows - 1);
+
+        int ix = static_cast<int>(gx);
+        int iz = static_cast<int>(gz);
+        if (ix < 0 || ix >= scene.grid_cols - 1 || iz < 0 || iz >= scene.grid_rows - 1)
+            continue;
+
+        /* Bilinear interpolation of elevation */
+        float fx = gx - ix;
+        float fz = gz - iz;
+        float e00 = scene.elevation[iz * scene.grid_cols + ix];
+        float e10 = scene.elevation[iz * scene.grid_cols + ix + 1];
+        float e01 = scene.elevation[(iz + 1) * scene.grid_cols + ix];
+        float e11 = scene.elevation[(iz + 1) * scene.grid_cols + ix + 1];
+        float terrain_y = e00 * (1 - fx) * (1 - fz) + e10 * fx * (1 - fz)
+                        + e01 * (1 - fx) * fz + e11 * fx * fz;
+
+        if (p.y <= terrain_y) {
+            /* Binary search refinement */
+            float lo = std::max(0.0f, t - step);
+            float hi = t;
+            for (int i = 0; i < 10; ++i) {
+                float mid = (lo + hi) * 0.5f;
+                glm::vec3 mp = origin + dir * mid;
+                float mgx = (mp.x + half_w) / width_m * (scene.grid_cols - 1);
+                float mgz = (mp.z + half_h) / height_m * (scene.grid_rows - 1);
+                int mix = std::clamp((int)mgx, 0, scene.grid_cols - 2);
+                int miz = std::clamp((int)mgz, 0, scene.grid_rows - 2);
+                float mfx = mgx - mix;
+                float mfz = mgz - miz;
+                float me00 = scene.elevation[miz * scene.grid_cols + mix];
+                float me10 = scene.elevation[miz * scene.grid_cols + mix + 1];
+                float me01 = scene.elevation[(miz + 1) * scene.grid_cols + mix];
+                float me11 = scene.elevation[(miz + 1) * scene.grid_cols + mix + 1];
+                float mh = me00 * (1 - mfx) * (1 - mfz) + me10 * mfx * (1 - mfz)
+                          + me01 * (1 - mfx) * mfz + me11 * mfx * mfz;
+                if (mp.y <= mh) hi = mid;
+                else lo = mid;
+            }
+            return origin + dir * ((lo + hi) * 0.5f);
+        }
+    }
+    return std::nullopt;
+}
+
+void App::place_node_at(const glm::vec3& world_pos) {
+    auto ll = m_proj.unproject(world_pos.x, world_pos.z);
+
+    /* Use default hardware profile (heltec_v3) */
+    const auto& hp = HARDWARE_PROFILES[0];
+
+    mesh3d_node_t node{};
+    int idx = static_cast<int>(scene.nodes.size());
+    snprintf(node.name, sizeof(node.name), "Node-%d", idx + 1);
+    node.id = idx + 1;
+    node.lat = ll.lat;
+    node.lon = ll.lon;
+    node.alt = world_pos.y;
+    node.antenna_height_m = 2.0f;
+    node.role = 1; // relay
+    node.max_range_km = hp.max_range_km;
+    node.tx_power_dbm = hp.tx_power_dbm;
+    node.antenna_gain_dbi = hp.antenna_gain_dbi;
+    node.rx_sensitivity_dbm = hp.rx_sensitivity_dbm;
+    node.frequency_mhz = hp.frequency_mhz;
+
+    NodeData nd;
+    nd.info = node;
+    nd.world_pos = glm::vec3(world_pos.x, world_pos.y + node.antenna_height_m, world_pos.z);
+    scene.nodes.push_back(nd);
+
+    /* Rebuild markers, spheres, and viewsheds */
+    scene.build_markers();
+    scene.build_spheres();
+    recompute_all_viewsheds(scene, m_proj);
+
+    LOG_INFO("Placed node '%s' at (%.4f, %.4f, %.0fm)", node.name, ll.lat, ll.lon, world_pos.y);
+}
+
+void App::delete_nearest_node(const glm::vec3& world_pos) {
+    if (scene.nodes.empty()) return;
+
+    float min_dist = std::numeric_limits<float>::max();
+    int nearest = -1;
+
+    for (int i = 0; i < (int)scene.nodes.size(); ++i) {
+        float d = glm::length(scene.nodes[i].world_pos - world_pos);
+        if (d < min_dist) {
+            min_dist = d;
+            nearest = i;
+        }
+    }
+
+    /* Threshold: within 500m (reasonable for typical mesh node spacing) */
+    if (nearest >= 0 && min_dist < 500.0f) {
+        LOG_INFO("Deleted node '%s'", scene.nodes[nearest].info.name);
+        scene.nodes.erase(scene.nodes.begin() + nearest);
+        scene.build_markers();
+        scene.build_spheres();
+        recompute_all_viewsheds(scene, m_proj);
+    }
 }
 
 bool App::poll_events() {
@@ -233,7 +542,10 @@ void App::frame(float dt) {
     }
 
     float aspect = static_cast<float>(m_width) / std::max(m_height, 1);
-    renderer.render(scene, camera, aspect);
+    renderer.render(scene, camera, aspect,
+                    m_width, m_height,
+                    &m_hud, &m_proj,
+                    m_node_placement_mode, m_show_controls);
 
     SDL_GL_SwapWindow(m_window);
 }

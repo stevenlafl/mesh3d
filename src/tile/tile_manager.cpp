@@ -1,6 +1,8 @@
 #include "tile/tile_manager.h"
 #include "tile/hgt_provider.h"
 #include "tile/url_tile_provider.h"
+#include "analysis/viewshed.h"
+#include "scene/scene.h"
 #include "camera/camera.h"
 #include "util/log.h"
 #include <cstring>
@@ -254,6 +256,93 @@ void TileManager::update_dynamic_tiles(double cam_lat, double cam_lon) {
         m_bounds = total;
         m_bounds_set = true;
     }
+}
+
+float TileManager::get_elevation_at(float world_x, float world_z,
+                                     const GeoProjection& proj) const {
+    LatLon ll = proj.unproject(world_x, world_z);
+
+    /* Determine which tile covers this point */
+    TileCoord coord;
+    if (m_hgt_provider) {
+        coord = HgtProvider::latlon_to_hgt_coord(ll.lat, ll.lon);
+    } else if (!m_visible_elev.empty()) {
+        coord = m_visible_elev[0]; // single-tile mode
+    } else {
+        return 0.0f;
+    }
+
+    /* Look up cached tile */
+    TileRenderable* tr = const_cast<TileCache&>(m_cache).get(coord);
+    if (!tr || tr->elevation.empty() || tr->elev_rows < 2 || tr->elev_cols < 2)
+        return 0.0f;
+
+    /* Map lat/lon to normalized [0,1] within tile bounds */
+    double u = (ll.lon - tr->bounds.min_lon) / (tr->bounds.max_lon - tr->bounds.min_lon);
+    double v = (tr->bounds.max_lat - ll.lat) / (tr->bounds.max_lat - tr->bounds.min_lat);
+
+    /* Clamp to valid range */
+    u = std::clamp(u, 0.0, 1.0);
+    v = std::clamp(v, 0.0, 1.0);
+
+    /* Convert to grid coordinates */
+    float gc = static_cast<float>(u * (tr->elev_cols - 1));
+    float gr = static_cast<float>(v * (tr->elev_rows - 1));
+
+    int c0 = std::clamp(static_cast<int>(gc), 0, tr->elev_cols - 2);
+    int r0 = std::clamp(static_cast<int>(gr), 0, tr->elev_rows - 2);
+    int c1 = c0 + 1;
+    int r1 = r0 + 1;
+
+    float fc = gc - c0;
+    float fr = gr - r0;
+
+    /* Bilinear interpolation */
+    float h00 = tr->elevation[r0 * tr->elev_cols + c0];
+    float h10 = tr->elevation[r1 * tr->elev_cols + c0];
+    float h01 = tr->elevation[r0 * tr->elev_cols + c1];
+    float h11 = tr->elevation[r1 * tr->elev_cols + c1];
+
+    float h0 = h00 + fc * (h01 - h00);
+    float h1 = h10 + fc * (h11 - h10);
+
+    return h0 + fr * (h1 - h0);
+}
+
+void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
+                                           const GeoProjection& proj) {
+    /* Iterate all cached tiles, compute viewshed per tile, rebuild mesh */
+    m_cache.for_each_mut([&](TileRenderable& tr) {
+        if (tr.elevation.empty() || tr.elev_rows < 2 || tr.elev_cols < 2)
+            return;
+
+        int total = tr.elev_rows * tr.elev_cols;
+        tr.viewshed.assign(total, 0);
+        tr.signal.assign(total, -999.0f);
+
+        /* Compute per-node viewshed on this tile's elevation grid */
+        for (auto& nd : nodes) {
+            std::vector<uint8_t> vis;
+            std::vector<float> sig;
+            compute_viewshed(tr.elevation.data(), tr.elev_rows, tr.elev_cols,
+                             tr.bounds, nd, vis, sig);
+
+            for (int i = 0; i < total; ++i) {
+                if (vis[i]) {
+                    tr.viewshed[i] = 1;
+                    if (sig[i] > tr.signal[i])
+                        tr.signal[i] = sig[i];
+                }
+            }
+        }
+
+        /* Rebuild mesh with overlay data (preserves texture) */
+        Texture saved_tex = std::move(tr.texture);
+        tr.mesh = m_builder.rebuild_mesh(tr, m_proj);
+        tr.texture = std::move(saved_tex);
+    });
+
+    LOG_INFO("Applied viewshed overlays to cached tiles for %zu nodes", nodes.size());
 }
 
 void TileManager::clear() {
