@@ -5,6 +5,7 @@
 #include "tile/tile_selector.h"
 #include "tile/tile_data.h"
 #include "tile/hgt_provider.h"
+#include "tile/dsm_provider.h"
 #include "util/math_util.h"
 #include <mesh3d/types.h>
 #include <memory>
@@ -30,6 +31,10 @@ public:
 
     /* Set HGT provider for dynamic elevation loading */
     void set_hgt_provider(std::unique_ptr<HgtProvider> provider);
+
+    /* Set DSM provider for high-resolution LiDAR elevation */
+    void set_dsm_provider(std::unique_ptr<DSMProvider> provider);
+    bool has_dsm_provider() const { return m_dsm_provider != nullptr; }
 
     /* Switch imagery source at runtime */
     void set_imagery_source(ImagerySource src);
@@ -77,6 +82,7 @@ private:
     std::unique_ptr<TileProvider> m_elev_provider;
     std::unique_ptr<TileProvider> m_imagery_provider;
     std::unique_ptr<HgtProvider> m_hgt_provider;
+    std::unique_ptr<DSMProvider> m_dsm_provider;
     ImagerySource m_imagery_source = ImagerySource::NONE;
 
     TileSelector m_selector;

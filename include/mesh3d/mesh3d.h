@@ -39,6 +39,13 @@ MESH3D_API void mesh3d_toggle_signal_spheres(void);
 MESH3D_API void mesh3d_toggle_wireframe(void);
 MESH3D_API void mesh3d_rebuild_scene(void);
 
+/* ── Propagation model ────────────────────────────────────────────── */
+MESH3D_API void mesh3d_set_propagation_model(mesh3d_prop_model_t model);
+MESH3D_API void mesh3d_set_itm_params(mesh3d_itm_params_t params);
+
+/* ── DSM data source ──────────────────────────────────────────────── */
+MESH3D_API void mesh3d_set_dsm_dir(const char* dir);
+
 /* Blocking convenience loop */
 MESH3D_API void mesh3d_run(void);
 

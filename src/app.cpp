@@ -1,6 +1,7 @@
 #include "app.h"
 #include "tile/hgt_provider.h"
 #include "tile/url_tile_provider.h"
+#include "tile/dsm_provider.h"
 #include "ui/hardware_profiles.h"
 #include "analysis/viewshed.h"
 #include "util/math_util.h"
@@ -218,9 +219,8 @@ void App::set_render_mode(mesh3d_render_mode_t mode) {
 
 void App::set_overlay_mode(mesh3d_overlay_mode_t mode) {
     scene.overlay_mode = mode;
-    LOG_INFO("Overlay: %s",
-             mode == MESH3D_OVERLAY_NONE ? "none" :
-             mode == MESH3D_OVERLAY_VIEWSHED ? "viewshed" : "signal");
+    const char* names[] = {"none", "viewshed", "signal", "link_margin"};
+    LOG_INFO("Overlay: %s", names[static_cast<int>(mode)]);
 }
 
 void App::toggle_signal_spheres() {
@@ -235,6 +235,22 @@ void App::toggle_wireframe() {
 
 void App::cycle_imagery_source() {
     scene.tile_manager.cycle_imagery_source();
+}
+
+void App::set_propagation_model(mesh3d_prop_model_t model) {
+    m_gpu_viewshed.set_propagation_model(model);
+}
+
+void App::set_itm_params(const mesh3d_itm_params_t& params) {
+    m_gpu_viewshed.set_itm_params(params);
+}
+
+void App::set_dsm_dir(const std::string& dir) {
+    if (dir.empty()) return;
+    auto dsm = std::make_unique<DSMProvider>();
+    dsm->set_data_dir(dir);
+    scene.tile_manager.set_dsm_provider(std::move(dsm));
+    LOG_INFO("DSM data directory: %s", dir.c_str());
 }
 
 void App::rebuild_scene() {
@@ -271,8 +287,8 @@ void App::handle_toggles() {
                         ? MESH3D_MODE_FLAT : MESH3D_MODE_TERRAIN);
     }
     if (m_input.consume_key1()) {
-        /* Cycle overlay: none -> viewshed -> signal -> none */
-        int next = (static_cast<int>(scene.overlay_mode) + 1) % 3;
+        /* Cycle overlay: none -> viewshed -> signal -> link_margin -> none */
+        int next = (static_cast<int>(scene.overlay_mode) + 1) % 4;
         set_overlay_mode(static_cast<mesh3d_overlay_mode_t>(next));
     }
     if (m_input.consume_key3()) cycle_imagery_source();
@@ -495,6 +511,9 @@ void App::place_node_at(const glm::vec3& world_pos) {
     node.antenna_gain_dbi = hp.antenna_gain_dbi;
     node.rx_sensitivity_dbm = hp.rx_sensitivity_dbm;
     node.frequency_mhz = hp.frequency_mhz;
+    node.cable_loss_db = hp.cable_loss_db;
+    node.bandwidth_khz = hp.bandwidth_khz;
+    node.spreading_factor = hp.spreading_factor;
 
     NodeData nd;
     nd.info = node;

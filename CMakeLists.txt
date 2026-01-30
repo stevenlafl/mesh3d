@@ -57,6 +57,9 @@ set(LIB_SOURCES
     src/tile/tile_manager.cpp
     src/tile/disk_cache.cpp
     src/tile/hgt_provider.cpp
+    src/tile/dsm_provider.cpp
+    src/tile/geotiff.cpp
+    src/analysis/itm.cpp
 )
 
 add_library(mesh3d_lib SHARED ${LIB_SOURCES})

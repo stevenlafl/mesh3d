@@ -445,6 +445,9 @@ void Hud::render(int screen_w, int screen_h,
         } else if (scene.overlay_mode == MESH3D_OVERLAY_SIGNAL) {
             overlay_name = "Signal";
             has_data = !scene.signal_strength.empty();
+        } else if (scene.overlay_mode == MESH3D_OVERLAY_LINK_MARGIN) {
+            overlay_name = "Link Margin";
+            has_data = !scene.signal_strength.empty();
         }
         if (scene.overlay_mode == MESH3D_OVERLAY_NONE) {
             snprintf(buf, sizeof(buf), "%.4f, %.4f  Alt: %.0fm  Speed: %.0f",

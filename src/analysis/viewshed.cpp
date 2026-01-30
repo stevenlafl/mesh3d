@@ -49,6 +49,12 @@ void compute_viewshed(const float* elevation, int rows, int cols,
     float antenna_gain = node.info.antenna_gain_dbi;
     float freq_mhz = node.info.frequency_mhz;
     if (freq_mhz <= 0) freq_mhz = 906.875f;
+    float cable_loss = node.info.cable_loss_db;
+    float rx_sens = node.info.rx_sensitivity_dbm;
+    if (rx_sens >= 0) rx_sens = -132.0f; // default
+
+    /* Earth curvature factor: 1 / (2 * k * Re) where k=4/3, Re=6371000m */
+    const float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
 
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
@@ -65,10 +71,14 @@ void compute_viewshed(const float* elevation, int rows, int cols,
 
             if (dist_cells > max_range_cells) continue;
 
-            /* Walk along the ray, check line-of-sight */
+            /* Walk along the ray with earth curvature and diffraction */
             int steps = static_cast<int>(dist_cells * 1.5f) + 1;
-            bool blocked = false;
             float target_elev = elevation[r * cols + c];
+            float d_total = dist_cells * cell_m;
+
+            /* Find maximum obstruction above LOS line (Deygout method) */
+            float max_violation = 0.0f;
+            float best_t = 0.0f;
 
             for (int s = 1; s < steps; ++s) {
                 float t = static_cast<float>(s) / steps;
@@ -79,25 +89,50 @@ void compute_viewshed(const float* elevation, int rows, int cols,
 
                 if (si < 0 || si >= rows || sj < 0 || sj >= cols) continue;
 
-                /* Height the LOS ray passes at this point */
-                float needed_h = obs_h + (target_elev - obs_h) * t;
-                if (elevation[si * cols + sj] > needed_h + 1.0f) {
-                    blocked = true;
-                    break;
+                /* LOS height with 4/3 earth curvature correction */
+                float d_along = d_total * t;
+                float d_remain = d_total * (1.0f - t);
+                float earth_curve = d_along * d_remain * earth_curve_factor;
+                float needed_h = obs_h + (target_elev - obs_h) * t - earth_curve;
+                float terrain_h = elevation[si * cols + sj];
+                float violation = terrain_h - needed_h;
+                if (violation > max_violation) {
+                    max_violation = violation;
+                    best_t = t;
                 }
             }
 
-            if (!blocked) {
-                visibility[r * cols + c] = 1;
+            /* Free-space path loss */
+            float dist_km = d_total / 1000.0f;
+            if (dist_km < 0.01f) dist_km = 0.01f;
+            float fspl = 20.0f * std::log10(dist_km)
+                       + 20.0f * std::log10(freq_mhz)
+                       + 32.44f;
 
-                /* Free-space path loss */
-                float dist_km = dist_cells * cell_m / 1000.0f;
-                if (dist_km < 0.01f) dist_km = 0.01f;
-                float fspl = 20.0f * std::log10(dist_km)
-                           + 20.0f * std::log10(freq_mhz)
-                           + 32.44f;
-                signal[r * cols + c] = tx_power_dbm + antenna_gain - fspl;
+            /* EIRP with cable loss */
+            float eirp = tx_power_dbm + antenna_gain - cable_loss;
+
+            /* Knife-edge diffraction loss (ITU-R P.526) */
+            float diff_loss_db = 0.0f;
+            if (max_violation > 0.0f) {
+                float lambda = 299.792458f / freq_mhz;
+                float d1 = d_total * best_t;
+                float d2 = d_total * (1.0f - best_t);
+                float d_harmonic = d1 * d2 / (d1 + d2);
+                float v = max_violation * std::sqrt(2.0f / (lambda * d_harmonic));
+                if (v > -0.78f) {
+                    diff_loss_db = 6.9f + 20.0f * std::log10(
+                        std::sqrt((v - 0.1f) * (v - 0.1f) + 1.0f) + v - 0.1f);
+                }
             }
+
+            float received = eirp - fspl - diff_loss_db;
+
+            /* Visibility based on RX sensitivity threshold */
+            if (received >= rx_sens) {
+                visibility[r * cols + c] = 1;
+            }
+            signal[r * cols + c] = received;
         }
     }
 }

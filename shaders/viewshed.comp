@@ -13,6 +13,9 @@ uniform float uTxPowerDbm;
 uniform float uAntennaGainDbi;
 uniform float uFreqMhz;
 uniform float uCellMeters;
+uniform float uCableLossDb;
+uniform float uRxSensitivityDbm;
+uniform float uEarthCurveFactor; // 1.0 / (2 * 4/3 * 6371000)
 
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
@@ -40,10 +43,14 @@ void main() {
         return;
     }
 
-    /* Ray-march line-of-sight check */
+    /* Ray-march with earth curvature correction and diffraction */
     float target_elev = imageLoad(uElevation, gid).r;
     int steps = int(dist_cells * 1.5) + 1;
-    bool blocked = false;
+    float d_total = dist_cells * uCellMeters;
+
+    /* Find maximum obstruction above LOS line (Deygout method) */
+    float max_violation = 0.0;
+    float best_t = 0.0;
 
     for (int s = 1; s < steps; ++s) {
         float t = float(s) / float(steps);
@@ -55,28 +62,52 @@ void main() {
         if (si < 0 || si >= uGridSize.y || sj < 0 || sj >= uGridSize.x)
             continue;
 
-        /* Height the LOS ray passes at this point */
-        float needed_h = uObserverHeight + (target_elev - uObserverHeight) * t;
+        /* LOS height with 4/3 earth curvature correction */
+        float d_along = d_total * t;
+        float d_remain = d_total * (1.0 - t);
+        float earth_curve = d_along * d_remain * uEarthCurveFactor;
+        float needed_h = uObserverHeight + (target_elev - uObserverHeight) * t - earth_curve;
         float terrain_h = imageLoad(uElevation, ivec2(sj, si)).r;
-        if (terrain_h > needed_h + 1.0) {
-            blocked = true;
-            break;
+        float violation = terrain_h - needed_h;
+        if (violation > max_violation) {
+            max_violation = violation;
+            best_t = t;
         }
     }
 
-    if (blocked) {
-        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
-    } else {
-        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+    /* Free-space path loss */
+    float dist_km = d_total / 1000.0;
+    dist_km = max(dist_km, 0.01);
+    float fspl = 20.0 * log(dist_km) / log(10.0)
+               + 20.0 * log(uFreqMhz) / log(10.0)
+               + 32.44;
 
-        /* Free-space path loss */
-        float dist_km = dist_cells * uCellMeters / 1000.0;
-        dist_km = max(dist_km, 0.01);
-        float fspl = 20.0 * log(dist_km) / log(10.0)
-                   + 20.0 * log(uFreqMhz) / log(10.0)
-                   + 32.44;
-        float sig = uTxPowerDbm + uAntennaGainDbi - fspl;
-        imageStore(uSignal, gid, vec4(sig, 0.0, 0.0, 0.0));
+    /* EIRP with cable loss */
+    float eirp = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
+
+    /* Knife-edge diffraction loss (ITU-R P.526) */
+    float diff_loss_db = 0.0;
+    if (max_violation > 0.0) {
+        float lambda = 299.792458 / uFreqMhz; // wavelength in meters
+        float d1 = d_total * best_t;
+        float d2 = d_total * (1.0 - best_t);
+        float d_harmonic = d1 * d2 / (d1 + d2);
+        float v = max_violation * sqrt(2.0 / (lambda * d_harmonic));
+        if (v <= -0.78) {
+            diff_loss_db = 0.0;
+        } else {
+            diff_loss_db = 6.9 + 20.0 * log(sqrt((v - 0.1) * (v - 0.1) + 1.0) + v - 0.1) / log(10.0);
+        }
+    }
+
+    float received = eirp - fspl - diff_loss_db;
+
+    /* Visibility based on RX sensitivity threshold */
+    if (received >= uRxSensitivityDbm) {
+        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
+    } else {
+        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
     }
 }

@@ -33,14 +33,44 @@ bool GpuViewshed::init(const std::string& shader_dir) {
         return false;
     }
 
+    /* ITM and Fresnel shaders are optional */
+    m_has_itm = m_itm_shader.load(shader_dir + "/itm.comp");
+    if (!m_has_itm) {
+        LOG_WARN("GPU viewshed: itm.comp not found, ITM model unavailable");
+    }
+
+    m_has_fresnel = m_fresnel_shader.load(shader_dir + "/fresnel.comp");
+    if (!m_has_fresnel) {
+        LOG_WARN("GPU viewshed: fresnel.comp not found, Fresnel model unavailable");
+    }
+
     m_initialized = true;
-    LOG_INFO("GPU viewshed compute shaders initialized");
+    LOG_INFO("GPU viewshed compute shaders initialized (ITM=%s, Fresnel=%s)",
+             m_has_itm ? "yes" : "no", m_has_fresnel ? "yes" : "no");
     return true;
 }
 
 void GpuViewshed::shutdown() {
     destroy_textures();
     m_initialized = false;
+}
+
+void GpuViewshed::set_propagation_model(mesh3d_prop_model_t model) {
+    if (model == MESH3D_PROP_ITM && !m_has_itm) {
+        LOG_WARN("ITM propagation model not available, keeping current model");
+        return;
+    }
+    if (model == MESH3D_PROP_FRESNEL && !m_has_fresnel) {
+        LOG_WARN("Fresnel propagation model not available, keeping current model");
+        return;
+    }
+    m_prop_model = model;
+    const char* names[] = {"FSPL", "ITM", "Fresnel"};
+    LOG_INFO("Propagation model: %s", names[static_cast<int>(model)]);
+}
+
+void GpuViewshed::set_itm_params(const mesh3d_itm_params_t& params) {
+    m_itm_params = params;
 }
 
 void GpuViewshed::create_textures(int rows, int cols) {
@@ -94,21 +124,27 @@ void GpuViewshed::destroy_textures() {
 }
 
 void GpuViewshed::clear_merge_textures() {
-    /* Clear merged visibility and overlap to 0 */
-    std::vector<uint8_t> zero_u8(m_rows * m_cols, 0);
-    glBindTexture(GL_TEXTURE_2D, m_merged_vis_tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_cols, m_rows,
-                    GL_RED_INTEGER, GL_UNSIGNED_BYTE, zero_u8.data());
-    glBindTexture(GL_TEXTURE_2D, m_overlap_tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_cols, m_rows,
-                    GL_RED_INTEGER, GL_UNSIGNED_BYTE, zero_u8.data());
+    /* Set pixel unpack alignment to 1 for R8UI textures (cols may not be multiple of 4) */
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    /* Clear merged signal to -999.0 */
-    std::vector<float> neg999(m_rows * m_cols, -999.0f);
-    glBindTexture(GL_TEXTURE_2D, m_merged_sig_tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_cols, m_rows,
-                    GL_RED, GL_FLOAT, neg999.data());
+    int total = m_rows * m_cols;
+    {
+        std::vector<uint8_t> zero_u8(total, 0);
+        glBindTexture(GL_TEXTURE_2D, m_merged_vis_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_cols, m_rows,
+                        GL_RED_INTEGER, GL_UNSIGNED_BYTE, zero_u8.data());
+        glBindTexture(GL_TEXTURE_2D, m_overlap_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_cols, m_rows,
+                        GL_RED_INTEGER, GL_UNSIGNED_BYTE, zero_u8.data());
+    }
+    {
+        std::vector<float> neg999(total, -999.0f);
+        glBindTexture(GL_TEXTURE_2D, m_merged_sig_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_cols, m_rows,
+                        GL_RED, GL_FLOAT, neg999.data());
+    }
 
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4); // restore default
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -147,6 +183,13 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
     double lat_res = (m_bounds.max_lat - m_bounds.min_lat) / (m_rows - 1);
     double lon_res = (m_bounds.max_lon - m_bounds.min_lon) / (m_cols - 1);
 
+    /* Select compute shader based on propagation model */
+    ComputeShader* active_shader = &m_viewshed_shader;
+    if (m_prop_model == MESH3D_PROP_ITM && m_has_itm)
+        active_shader = &m_itm_shader;
+    else if (m_prop_model == MESH3D_PROP_FRESNEL && m_has_fresnel)
+        active_shader = &m_fresnel_shader;
+
     for (auto& nd : nodes) {
         /* Map node to grid cell */
         int nr = static_cast<int>((m_bounds.max_lat - nd.info.lat) / lat_res);
@@ -181,23 +224,46 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
         float antenna_gain = nd.info.antenna_gain_dbi;
         float freq_mhz = nd.info.frequency_mhz;
         if (freq_mhz <= 0) freq_mhz = 906.875f;
+        float cable_loss = nd.info.cable_loss_db;
+        float rx_sens = nd.info.rx_sensitivity_dbm;
+        if (rx_sens >= 0) rx_sens = -132.0f;
+
+        /* Earth curvature factor: 1 / (2 * k * Re) where k=4/3, Re=6371000m */
+        float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
 
         /* --- Viewshed pass --- */
-        m_viewshed_shader.use();
-        m_viewshed_shader.set_ivec2("uGridSize", m_cols, m_rows);
-        m_viewshed_shader.set_ivec2("uNodeCell", nc, nr);
-        m_viewshed_shader.set_float("uObserverHeight", obs_h);
-        m_viewshed_shader.set_int("uMaxRangeCells", max_range_cells);
-        m_viewshed_shader.set_float("uTxPowerDbm", tx_power_dbm);
-        m_viewshed_shader.set_float("uAntennaGainDbi", antenna_gain);
-        m_viewshed_shader.set_float("uFreqMhz", freq_mhz);
-        m_viewshed_shader.set_float("uCellMeters", m_cell_meters);
+        active_shader->use();
+        active_shader->set_ivec2("uGridSize", m_cols, m_rows);
+        active_shader->set_ivec2("uNodeCell", nc, nr);
+        active_shader->set_float("uObserverHeight", obs_h);
+        active_shader->set_int("uMaxRangeCells", max_range_cells);
+        active_shader->set_float("uTxPowerDbm", tx_power_dbm);
+        active_shader->set_float("uAntennaGainDbi", antenna_gain);
+        active_shader->set_float("uFreqMhz", freq_mhz);
+        active_shader->set_float("uCellMeters", m_cell_meters);
+        active_shader->set_float("uCableLossDb", cable_loss);
+        active_shader->set_float("uRxSensitivityDbm", rx_sens);
+        active_shader->set_float("uEarthCurveFactor", earth_curve_factor);
+
+        /* ITM-specific uniforms */
+        if (m_prop_model == MESH3D_PROP_ITM && m_has_itm) {
+            active_shader->set_int("uClimate", m_itm_params.climate);
+            active_shader->set_float("uGroundDielectric", m_itm_params.ground_dielectric);
+            active_shader->set_float("uGroundConductivity", m_itm_params.ground_conductivity);
+            active_shader->set_int("uPolarization", m_itm_params.polarization);
+            active_shader->set_float("uTargetHeight", 2.0f);
+        }
+
+        /* Fresnel-specific uniforms */
+        if (m_prop_model == MESH3D_PROP_FRESNEL && m_has_fresnel) {
+            active_shader->set_float("uTargetHeight", 2.0f);
+        }
 
         glBindImageTexture(0, m_elevation_tex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
         glBindImageTexture(1, m_node_vis_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
         glBindImageTexture(2, m_node_sig_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
 
-        m_viewshed_shader.dispatch(groups_x, groups_y, 1);
+        active_shader->dispatch(groups_x, groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
         /* --- Merge pass --- */
@@ -225,6 +291,9 @@ void GpuViewshed::read_back(std::vector<uint8_t>& vis,
     signal.resize(total);
     overlap.resize(total);
 
+    /* Set pack alignment to 1 for R8UI textures (cols may not be multiple of 4) */
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
     /* Read merged visibility */
     glBindTexture(GL_TEXTURE_2D, m_merged_vis_tex);
     glGetTexImage(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, vis.data());
@@ -237,6 +306,7 @@ void GpuViewshed::read_back(std::vector<uint8_t>& vis,
     glBindTexture(GL_TEXTURE_2D, m_overlap_tex);
     glGetTexImage(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, overlap.data());
 
+    glPixelStorei(GL_PACK_ALIGNMENT, 4); // restore default
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 

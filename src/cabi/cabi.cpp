@@ -59,6 +59,18 @@ void mesh3d_rebuild_scene(void) {
     app().rebuild_scene();
 }
 
+void mesh3d_set_propagation_model(mesh3d_prop_model_t model) {
+    app().set_propagation_model(model);
+}
+
+void mesh3d_set_itm_params(mesh3d_itm_params_t params) {
+    app().set_itm_params(params);
+}
+
+void mesh3d_set_dsm_dir(const char* dir) {
+    app().set_dsm_dir(dir ? dir : "");
+}
+
 void mesh3d_run(void) {
     app().run();
 }

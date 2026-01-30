@@ -6,10 +6,11 @@ in vec2 vUV;
 in float vViewshed;
 in float vSignalDbm;
 
-uniform int uOverlayMode; // 0=none, 1=viewshed, 2=signal
+uniform int uOverlayMode; // 0=none, 1=viewshed, 2=signal, 3=link_margin
 uniform int uUseSatelliteTex;
 uniform sampler2D uSatelliteTex;
 uniform vec3 uLightDir;
+uniform float uRxSensitivity; // dBm, for link margin overlay
 
 out vec4 FragColor;
 
@@ -63,6 +64,23 @@ void main() {
         if (vSignalDbm > -900.0) {
             vec3 sc = signalColor(vSignalDbm);
             color = mix(color, sc, 0.6);
+        }
+    } else if (uOverlayMode == 3) {
+        // Link margin overlay
+        if (vSignalDbm > -900.0) {
+            float margin = vSignalDbm - uRxSensitivity;
+            vec3 mc;
+            if (margin < 0.0) {
+                mc = vec3(0.0); // black — no link
+            } else if (margin < 10.0) {
+                mc = mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), margin / 10.0); // red->yellow
+            } else if (margin < 20.0) {
+                mc = mix(vec3(1.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0), (margin - 10.0) / 10.0); // yellow->green
+            } else {
+                mc = vec3(0.0, 1.0, 0.0); // strong green
+            }
+            float blend = margin < 0.0 ? 0.3 : 0.6;
+            color = mix(color, mc, blend);
         }
     }
 

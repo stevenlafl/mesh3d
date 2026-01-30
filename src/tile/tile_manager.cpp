@@ -207,6 +207,12 @@ void TileManager::set_hgt_provider(std::unique_ptr<HgtProvider> provider) {
     LOG_INFO("HGT provider set on tile manager");
 }
 
+void TileManager::set_dsm_provider(std::unique_ptr<DSMProvider> provider) {
+    m_dsm_provider = std::move(provider);
+    m_elev_loaded = false;
+    LOG_INFO("DSM provider set on tile manager");
+}
+
 void TileManager::update(const Camera& cam, const GeoProjection& proj) {
     if (!m_hgt_provider) {
         update(); // fallback to static mode

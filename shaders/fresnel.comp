@@ -1,0 +1,261 @@
+#version 430 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r32f)  uniform readonly  image2D  uElevation;
+layout(binding = 1, r8ui)  uniform writeonly uimage2D uVisibility;
+layout(binding = 2, r32f)  uniform writeonly image2D  uSignal;
+
+uniform ivec2 uGridSize;
+uniform ivec2 uNodeCell;
+uniform float uObserverHeight;
+uniform int   uMaxRangeCells;
+uniform float uTxPowerDbm;
+uniform float uAntennaGainDbi;
+uniform float uFreqMhz;
+uniform float uCellMeters;
+uniform float uCableLossDb;
+uniform float uRxSensitivityDbm;
+uniform float uEarthCurveFactor;
+uniform float uTargetHeight;     // default 2.0m
+
+const float PI = 3.141592653589793;
+const int MAX_PROFILE = 512;
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    int c = gid.x;
+    int r = gid.y;
+
+    if (c >= uGridSize.x || r >= uGridSize.y)
+        return;
+
+    int dc = c - uNodeCell.x;
+    int dr = r - uNodeCell.y;
+    float dist_cells = sqrt(float(dc * dc + dr * dr));
+
+    /* Node's own cell */
+    if (dist_cells < 0.5) {
+        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(-60.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    /* Out of range */
+    if (dist_cells > float(uMaxRangeCells)) {
+        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    float d_total = dist_cells * uCellMeters;
+    float lambda = 299.792458 / uFreqMhz;
+    float target_elev = imageLoad(uElevation, gid).r;
+    float rx_h = target_elev + uTargetHeight;
+
+    /* Extract terrain profile */
+    int n_raw = int(dist_cells) + 1;
+    int step = max(1, (n_raw + MAX_PROFILE - 1) / MAX_PROFILE);
+    int n_profile = min((n_raw + step - 1) / step, MAX_PROFILE);
+
+    /* Bullington equivalent construction:
+       1. Find tangent line from TX over profile (highest tangent angle)
+       2. Find tangent line from RX back over profile
+       3. Where they intersect = equivalent knife edge
+       Then apply Deygout correction for secondary obstructions. */
+
+    float max_tan_tx = -1e30;  // max tangent angle from TX
+    int   max_tan_tx_i = 0;
+    float max_tan_rx = -1e30;  // max tangent angle from RX
+    int   max_tan_rx_i = 0;
+
+    for (int i = 1; i < n_profile - 1; ++i) {
+        float t = float(i * step) / dist_cells;
+        t = min(t, 1.0);
+        float sr = float(uNodeCell.y) + float(dr) * t;
+        float sc = float(uNodeCell.x) + float(dc) * t;
+        int si = clamp(int(sr), 0, uGridSize.y - 1);
+        int sj = clamp(int(sc), 0, uGridSize.x - 1);
+        float elev = imageLoad(uElevation, ivec2(sj, si)).r;
+
+        /* Earth curvature correction */
+        float d_along = d_total * t;
+        float d_remain = d_total * (1.0 - t);
+        float earth_curve = d_along * d_remain * uEarthCurveFactor;
+
+        /* Tangent angle from TX */
+        float h_above_tx = (elev - earth_curve) - uObserverHeight;
+        float tan_tx = h_above_tx / d_along;
+        if (tan_tx > max_tan_tx) {
+            max_tan_tx = tan_tx;
+            max_tan_tx_i = i;
+        }
+
+        /* Tangent angle from RX */
+        float h_above_rx = (elev - earth_curve) - rx_h;
+        float tan_rx = h_above_rx / d_remain;
+        if (tan_rx > max_tan_rx) {
+            max_tan_rx = tan_rx;
+            max_tan_rx_i = i;
+        }
+    }
+
+    /* Compute diffraction loss */
+    float diff_loss_db = 0.0;
+
+    /* Check if path is obstructed at all */
+    float los_tan = (rx_h - uObserverHeight) / d_total;
+    bool obstructed = (max_tan_tx > los_tan);
+
+    if (obstructed) {
+        /* Bullington construction: find equivalent knife edge */
+        /* Use the dominant obstruction point (from TX tangent) */
+        float t_edge = float(max_tan_tx_i * step) / dist_cells;
+        float d1 = d_total * t_edge;
+        float d2 = d_total * (1.0 - t_edge);
+
+        /* Get edge elevation with curvature correction */
+        float sr_edge = float(uNodeCell.y) + float(dr) * t_edge;
+        float sc_edge = float(uNodeCell.x) + float(dc) * t_edge;
+        int si_edge = clamp(int(sr_edge), 0, uGridSize.y - 1);
+        int sj_edge = clamp(int(sc_edge), 0, uGridSize.x - 1);
+        float edge_elev = imageLoad(uElevation, ivec2(sj_edge, si_edge)).r;
+        float earth_curve_edge = d1 * d2 * uEarthCurveFactor;
+        float effective_edge_h = edge_elev - earth_curve_edge;
+
+        /* LOS height at edge position */
+        float los_at_edge = uObserverHeight + (rx_h - uObserverHeight) * t_edge;
+
+        /* Knife-edge clearance violation */
+        float violation = effective_edge_h - los_at_edge;
+        if (violation > 0.0) {
+            float d_harmonic = d1 * d2 / (d1 + d2);
+            float v = violation * sqrt(2.0 / (lambda * d_harmonic));
+
+            /* Primary knife-edge loss (ITU-R P.526) */
+            if (v > -0.78) {
+                diff_loss_db = 6.9 + 20.0 * log(sqrt((v - 0.1) * (v - 0.1) + 1.0) + v - 0.1) / log(10.0);
+            }
+
+            /* Deygout correction for secondary obstructions:
+               Check for obstructions on TX-edge and edge-RX sub-paths */
+
+            /* TX to edge sub-path */
+            float max_v2_tx = 0.0;
+            for (int j = 1; j < max_tan_tx_i; ++j) {
+                float t2 = float(j * step) / dist_cells;
+                float sr2 = float(uNodeCell.y) + float(dr) * t2;
+                float sc2 = float(uNodeCell.x) + float(dc) * t2;
+                int si2 = clamp(int(sr2), 0, uGridSize.y - 1);
+                int sj2 = clamp(int(sc2), 0, uGridSize.x - 1);
+                float e2 = imageLoad(uElevation, ivec2(sj2, si2)).r;
+
+                float d2_along = d_total * t2;
+                float d2_to_edge = d1 - d2_along;
+                if (d2_to_edge <= 0.0 || d2_along <= 0.0) continue;
+                float ec2 = d2_along * d2_to_edge * uEarthCurveFactor;
+                float eff_e2 = e2 - ec2;
+
+                /* LOS between TX and edge at this point */
+                float t_sub = d2_along / d1;
+                float los_sub = uObserverHeight + (effective_edge_h - uObserverHeight) * t_sub;
+                float viol2 = eff_e2 - los_sub;
+                if (viol2 > 0.0) {
+                    float dh2 = d2_along * d2_to_edge / (d2_along + d2_to_edge);
+                    float v2 = viol2 * sqrt(2.0 / (lambda * dh2));
+                    max_v2_tx = max(max_v2_tx, v2);
+                }
+            }
+
+            /* Edge to RX sub-path */
+            float max_v2_rx = 0.0;
+            int n_after = n_profile - 1 - max_tan_tx_i;
+            for (int j = max_tan_tx_i + 1; j < n_profile - 1; ++j) {
+                float t2 = float(j * step) / dist_cells;
+                float sr2 = float(uNodeCell.y) + float(dr) * t2;
+                float sc2 = float(uNodeCell.x) + float(dc) * t2;
+                int si2 = clamp(int(sr2), 0, uGridSize.y - 1);
+                int sj2 = clamp(int(sc2), 0, uGridSize.x - 1);
+                float e2 = imageLoad(uElevation, ivec2(sj2, si2)).r;
+
+                float d2_from_edge = d_total * t2 - d1;
+                float d2_to_rx = d2 - d2_from_edge;
+                if (d2_to_rx <= 0.0 || d2_from_edge <= 0.0) continue;
+                float ec2 = (d1 + d2_from_edge) * d2_to_rx * uEarthCurveFactor;
+                float eff_e2 = e2 - ec2;
+
+                float t_sub = d2_from_edge / d2;
+                float los_sub = effective_edge_h + (rx_h - effective_edge_h) * t_sub;
+                float viol2 = eff_e2 - los_sub;
+                if (viol2 > 0.0) {
+                    float dh2 = d2_from_edge * d2_to_rx / (d2_from_edge + d2_to_rx);
+                    float v2 = viol2 * sqrt(2.0 / (lambda * dh2));
+                    max_v2_rx = max(max_v2_rx, v2);
+                }
+            }
+
+            /* Add secondary knife-edge losses (Deygout correction) */
+            if (max_v2_tx > 0.0) {
+                float sec_loss = 6.9 + 20.0 * log(sqrt((max_v2_tx - 0.1) * (max_v2_tx - 0.1) + 1.0)
+                                                    + max_v2_tx - 0.1) / log(10.0);
+                diff_loss_db += max(sec_loss, 0.0);
+            }
+            if (max_v2_rx > 0.0) {
+                float sec_loss = 6.9 + 20.0 * log(sqrt((max_v2_rx - 0.1) * (max_v2_rx - 0.1) + 1.0)
+                                                    + max_v2_rx - 0.1) / log(10.0);
+                diff_loss_db += max(sec_loss, 0.0);
+            }
+        }
+    } else {
+        /* Unobstructed: check Fresnel zone clearance */
+        /* Find minimum clearance as fraction of 1st Fresnel zone radius */
+        float min_clearance_ratio = 1e30;
+
+        for (int i = 1; i < n_profile - 1; ++i) {
+            float t = float(i * step) / dist_cells;
+            t = min(t, 1.0);
+            float sr = float(uNodeCell.y) + float(dr) * t;
+            float sc = float(uNodeCell.x) + float(dc) * t;
+            int si = clamp(int(sr), 0, uGridSize.y - 1);
+            int sj = clamp(int(sc), 0, uGridSize.x - 1);
+            float elev = imageLoad(uElevation, ivec2(sj, si)).r;
+
+            float d_along = d_total * t;
+            float d_remain = d_total * (1.0 - t);
+            float earth_curve = d_along * d_remain * uEarthCurveFactor;
+
+            float los_h = uObserverHeight + (rx_h - uObserverHeight) * t;
+            float clearance = los_h - (elev - earth_curve);
+
+            float fresnel_radius = sqrt(lambda * d_along * d_remain / (d_along + d_remain));
+            float ratio = clearance / max(fresnel_radius, 0.001);
+            min_clearance_ratio = min(min_clearance_ratio, ratio);
+        }
+
+        /* Sub-Fresnel clearance causes minor diffraction loss */
+        if (min_clearance_ratio < 1.0 && min_clearance_ratio >= 0.0) {
+            /* Gradual loss for partial Fresnel zone obstruction */
+            diff_loss_db = 6.0 * (1.0 - min_clearance_ratio);
+        } else if (min_clearance_ratio < 0.0) {
+            /* Shouldn't happen if path is "unobstructed" but handle gracefully */
+            float v = -min_clearance_ratio;
+            diff_loss_db = 6.9 + 20.0 * log(sqrt((v - 0.1) * (v - 0.1) + 1.0) + v - 0.1) / log(10.0);
+        }
+    }
+
+    /* Free-space path loss */
+    float dist_km = d_total / 1000.0;
+    dist_km = max(dist_km, 0.01);
+    float fspl = 20.0 * log(dist_km) / log(10.0)
+               + 20.0 * log(uFreqMhz) / log(10.0)
+               + 32.44;
+
+    float eirp = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
+    float received = eirp - fspl - max(diff_loss_db, 0.0);
+
+    if (received >= uRxSensitivityDbm) {
+        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+    } else {
+        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
+    }
+    imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
+}
