@@ -33,6 +33,21 @@ public:
     /* Clear all cached tiles */
     void clear();
 
+    /* Iterate all cached tiles */
+    template<typename Fn>
+    void for_each(Fn fn) const {
+        for (auto& [coord, entry] : m_map) {
+            fn(entry.tile);
+        }
+    }
+
+    template<typename Fn>
+    void for_each_mut(Fn fn) {
+        for (auto& [coord, entry] : m_map) {
+            fn(entry.tile);
+        }
+    }
+
     int size() const { return static_cast<int>(m_map.size()); }
     int max_tiles() const { return m_max_tiles; }
 

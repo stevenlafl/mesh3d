@@ -16,6 +16,10 @@ struct LocalCoord {
     float x, z;
 };
 
+struct LatLon {
+    double lat, lon;
+};
+
 struct GeoProjection {
     double center_lat, center_lon;
     double m_per_deg_lat;
@@ -40,6 +44,12 @@ struct GeoProjection {
 
     float height_m(const mesh3d_bounds_t& b) const {
         return static_cast<float>((b.max_lat - b.min_lat) * m_per_deg_lat);
+    }
+
+    LatLon unproject(float world_x, float world_z) const {
+        double lon = center_lon + world_x / m_per_deg_lon;
+        double lat = center_lat - world_z / m_per_deg_lat; // -Z = north
+        return {lat, lon};
     }
 };
 

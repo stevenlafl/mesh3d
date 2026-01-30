@@ -31,6 +31,14 @@ Mesh build_terrain_mesh(const TerrainBuildData& data, const GeoProjection& proj)
     float dz = h / (rows - 1);
     float yscale = data.elevation_scale;
 
+    /* Project tile corners to world space so tiles are placed correctly.
+       Row 0 = north (max_lat), row last = south (min_lat).
+       Col 0 = west (min_lon), col last = east (max_lon). */
+    auto nw = proj.project(data.bounds.max_lat, data.bounds.min_lon);
+    auto se = proj.project(data.bounds.min_lat, data.bounds.max_lon);
+    float x_start = nw.x; // west edge
+    float z_start = nw.z; // north edge
+
     /* Vertices */
     std::vector<float> verts(rows * cols * VERT_FLOATS);
     for (int r = 0; r < rows; ++r) {
@@ -40,8 +48,8 @@ Mesh build_terrain_mesh(const TerrainBuildData& data, const GeoProjection& proj)
             float v = static_cast<float>(r) / (rows - 1);
 
             /* Position: X = east, Y = up, Z = south */
-            float x = -w * 0.5f + c * dx;
-            float z = -h * 0.5f + r * dz;
+            float x = x_start + c * dx;
+            float z = z_start + r * dz;
             float y = data.elevation[r * cols + c] * yscale;
 
             glm::vec3 n = calc_normal(data.elevation, r, c, rows, cols, dx, dz, yscale);

@@ -5,7 +5,7 @@
 #include "render/renderer.h"
 #include "camera/camera.h"
 #include "camera/input.h"
-#include "db/db.h"
+#include "util/math_util.h"
 #include <mesh3d/types.h>
 
 namespace mesh3d {
@@ -16,10 +16,8 @@ public:
     bool init(int width, int height, const char* title);
     void shutdown();
 
-    /* Database */
-    bool connect_db(const char* conninfo);
-    bool load_project(int project_id);
-    void disconnect_db();
+    /* HGT streaming mode (no DB needed) */
+    bool init_hgt_mode(double center_lat, double center_lon);
 
     /* Direct data injection */
     bool set_terrain(const mesh3d_grid_f32_t& grid, const mesh3d_bounds_t& bounds);
@@ -50,13 +48,11 @@ private:
     int m_width = 1280, m_height = 720;
 
     InputHandler m_input;
-    Database     m_db;
     std::string  m_shader_dir;
+    GeoProjection m_proj;
+    bool m_hgt_mode = false;
 
     void handle_toggles();
-
-    /* Generate synthetic demo data */
-    void generate_demo_scene();
 };
 
 /* Global app instance */

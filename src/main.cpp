@@ -2,22 +2,24 @@
 #include "util/log.h"
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 
 int main(int argc, char* argv[]) {
     using namespace mesh3d;
 
     int width = 1280, height = 720;
-    const char* title = "mesh3d — 3D Viewshed Visualizer";
-    const char* db_conninfo = nullptr;
+    const char* title = "mesh3d — 3D Terrain Viewer";
     const char* texture_path = nullptr;
-    int project_id = -1;
+    double center_lat = 40.3978, center_lon = -105.0750; // Loveland, CO
 
     /* Simple arg parsing */
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
-            db_conninfo = argv[++i];
-        } else if (std::strcmp(argv[i], "--project") == 0 && i + 1 < argc) {
-            project_id = std::atoi(argv[++i]);
+        if (std::strcmp(argv[i], "--center") == 0 && i + 1 < argc) {
+            const char* val = argv[++i];
+            if (std::sscanf(val, "%lf,%lf", &center_lat, &center_lon) != 2) {
+                fprintf(stderr, "Invalid --center format, expected LAT,LON\n");
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
             width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
@@ -28,8 +30,7 @@ int main(int argc, char* argv[]) {
             log_set_level(LogLevel::Debug);
         } else if (std::strcmp(argv[i], "--help") == 0) {
             printf("Usage: mesh3d [options]\n"
-                   "  --db CONNINFO     PostgreSQL connection string\n"
-                   "  --project ID      Project ID to load\n"
+                   "  --center LAT,LON  Starting center (default: 40.3978,-105.075 Loveland CO)\n"
                    "  --texture PATH    Load satellite texture from file\n"
                    "  --width W         Window width (default 1280)\n"
                    "  --height H        Window height (default 720)\n"
@@ -57,15 +58,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    /* Optionally connect to DB and load project */
-    if (db_conninfo) {
-        if (!a.connect_db(db_conninfo)) {
-            LOG_WARN("DB connection failed, running with demo data");
-        } else if (project_id > 0) {
-            if (!a.load_project(project_id)) {
-                LOG_WARN("Failed to load project %d, running with demo data", project_id);
-            }
-        }
+    /* HGT streaming mode (always active) */
+    if (!a.init_hgt_mode(center_lat, center_lon)) {
+        LOG_ERROR("Failed to initialize HGT mode");
+        a.shutdown();
+        return 1;
     }
 
     /* Load manual texture override if specified */

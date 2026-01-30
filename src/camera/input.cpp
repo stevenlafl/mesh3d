@@ -8,6 +8,21 @@ void InputHandler::process_event(const SDL_Event& ev, Camera& cam) {
         m_quit = true;
         break;
 
+    case SDL_WINDOWEVENT:
+        if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+            m_focused = true;
+        } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+            m_focused = false;
+            /* Release all held keys so camera doesn't drift */
+            m_fwd = m_back = m_left = m_right = m_up = m_down = false;
+            m_sprint = false;
+            if (m_mouse_captured) {
+                m_mouse_captured = false;
+                SDL_SetRelativeMouseMode(SDL_FALSE);
+            }
+        }
+        break;
+
     case SDL_KEYDOWN:
         if (ev.key.repeat) break;
         switch (ev.key.keysym.sym) {
@@ -57,7 +72,7 @@ void InputHandler::process_event(const SDL_Event& ev, Camera& cam) {
         break;
 
     case SDL_MOUSEMOTION:
-        if (m_mouse_captured) {
+        if (m_mouse_captured && m_focused) {
             cam.rotate(static_cast<float>(ev.motion.xrel),
                       -static_cast<float>(ev.motion.yrel));
         }

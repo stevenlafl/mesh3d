@@ -12,7 +12,7 @@ public:
     float fov    = 60.0f;
     float near_plane = 1.0f;
     float far_plane  = 100000.0f; // 100 km
-    float move_speed = 200.0f;    // m/s base
+    float move_speed = 1000.0f;   // m/s base
     float mouse_sensitivity = 0.1f;
     float sprint_multiplier = 4.0f;
 

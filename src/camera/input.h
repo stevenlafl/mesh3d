@@ -34,6 +34,8 @@ private:
     /* toggle keys (edge-triggered) */
     bool m_tab = false, m_key1 = false, m_key2 = false, m_key3 = false;
     bool m_keyT = false, m_keyF = false;
+
+    bool m_focused = true;
 };
 
 } // namespace mesh3d

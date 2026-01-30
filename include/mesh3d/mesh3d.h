@@ -21,7 +21,7 @@ extern "C" {
 MESH3D_API int  mesh3d_init(int w, int h, const char* title);
 MESH3D_API void mesh3d_shutdown(void);
 
-/* ── Database ──────────────────────────────────────────────────────── */
+/* ── Database (deprecated — stubs for ABI compatibility) ───────────── */
 MESH3D_API int  mesh3d_connect_db(const char* conninfo);
 MESH3D_API int  mesh3d_load_project(int project_id);
 MESH3D_API void mesh3d_disconnect_db(void);

@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsdl2-dev \
     libgl-dev \
     libglm-dev \
-    libpq-dev \
+    zlib1g-dev \
     libcurl4-openssl-dev \
     python3 \
     python3-pip \

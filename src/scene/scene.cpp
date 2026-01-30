@@ -123,6 +123,13 @@ void Scene::rebuild_all() {
 }
 
 void Scene::init_tile_provider() {
+    /* If HGT provider is already set (via init_hgt_mode), skip SingleTileProvider setup */
+    if (tile_manager.has_hgt_provider()) {
+        use_tile_system = true;
+        LOG_INFO("Tile system: using HGT provider");
+        return;
+    }
+
     if (elevation.empty() || grid_rows < 2 || grid_cols < 2) {
         use_tile_system = false;
         return;

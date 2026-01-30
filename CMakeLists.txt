@@ -9,14 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(SDL2 REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(CURL REQUIRED)
-
-# libpq
-find_path(LIBPQ_INCLUDE_DIR libpq-fe.h
-    PATHS /usr/include /usr/include/postgresql /usr/local/include)
-find_library(LIBPQ_LIBRARY NAMES pq)
-if(NOT LIBPQ_LIBRARY)
-    message(FATAL_ERROR "libpq not found")
-endif()
+find_package(ZLIB REQUIRED)
 
 # GLM — prefer system, fall back to bundled
 find_package(glm QUIET)
@@ -39,8 +32,6 @@ target_include_directories(stb INTERFACE third_party/stb)
 # ── Library sources ───────────────────────────────────────────────────
 set(LIB_SOURCES
     src/app.cpp
-    src/db/db.cpp
-    src/db/loader.cpp
     src/scene/scene.cpp
     src/scene/terrain.cpp
     src/scene/node_marker.cpp
@@ -61,15 +52,16 @@ set(LIB_SOURCES
     src/tile/tile_selector.cpp
     src/tile/tile_manager.cpp
     src/tile/disk_cache.cpp
+    src/tile/hgt_provider.cpp
 )
 
 add_library(mesh3d_lib SHARED ${LIB_SOURCES})
 target_include_directories(mesh3d_lib
     PUBLIC  include
-    PRIVATE src ${LIBPQ_INCLUDE_DIR} ${GLM_INCLUDE_DIR}
+    PRIVATE src ${GLM_INCLUDE_DIR}
 )
 target_link_libraries(mesh3d_lib
-    PUBLIC  glad stb OpenGL::GL ${LIBPQ_LIBRARY} CURL::libcurl
+    PUBLIC  glad stb OpenGL::GL CURL::libcurl ZLIB::ZLIB
 )
 target_compile_definitions(mesh3d_lib PRIVATE MESH3D_EXPORTS)
 
@@ -89,7 +81,7 @@ set_target_properties(mesh3d_lib PROPERTIES
 
 # ── Executable ────────────────────────────────────────────────────────
 add_executable(mesh3d_app src/main.cpp)
-target_include_directories(mesh3d_app PRIVATE src ${GLM_INCLUDE_DIR} ${LIBPQ_INCLUDE_DIR})
+target_include_directories(mesh3d_app PRIVATE src ${GLM_INCLUDE_DIR})
 target_link_libraries(mesh3d_app PRIVATE mesh3d_lib)
 set_target_properties(mesh3d_app PROPERTIES
     OUTPUT_NAME mesh3d

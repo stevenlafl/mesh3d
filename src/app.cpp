@@ -1,6 +1,6 @@
 #include "app.h"
-#include "db/loader.h"
-#include "scene/terrain.h"
+#include "tile/hgt_provider.h"
+#include "tile/url_tile_provider.h"
 #include "util/math_util.h"
 #include "util/log.h"
 #include <glad/glad.h>
@@ -15,6 +15,8 @@ App& app() { return g_app; }
 bool App::init(int width, int height, const char* title) {
     m_width = width;
     m_height = height;
+
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
@@ -84,28 +86,39 @@ bool App::init(int width, int height, const char* title) {
 
 void App::shutdown() {
     scene.clear();
-    disconnect_db();
     if (m_gl_ctx) { SDL_GL_DeleteContext(m_gl_ctx); m_gl_ctx = nullptr; }
     if (m_window) { SDL_DestroyWindow(m_window); m_window = nullptr; }
     SDL_Quit();
     LOG_INFO("mesh3d shut down");
 }
 
-bool App::connect_db(const char* conninfo) {
-    return m_db.connect(conninfo);
-}
+bool App::init_hgt_mode(double center_lat, double center_lon) {
+    LOG_INFO("Initializing HGT mode: center (%.4f, %.4f)", center_lat, center_lon);
 
-bool App::load_project(int project_id) {
-    if (!m_db.connected()) {
-        LOG_ERROR("Not connected to database");
-        return false;
-    }
-    DataLoader loader(m_db);
-    return loader.load_project(project_id, scene);
-}
+    /* Initial bounds: center tile (camera-driven loading will expand as needed) */
+    auto center_coord = HgtProvider::latlon_to_hgt_coord(center_lat, center_lon);
+    mesh3d_bounds_t initial_bounds = HgtProvider::hgt_tile_bounds(center_coord);
 
-void App::disconnect_db() {
-    m_db.disconnect();
+    scene.bounds = initial_bounds;
+    m_proj.init(initial_bounds);
+
+    /* Create HGT provider and attach to tile manager */
+    auto hgt = std::make_unique<HgtProvider>();
+    scene.tile_manager.set_hgt_provider(std::move(hgt));
+    scene.tile_manager.set_bounds(initial_bounds);
+
+    scene.use_tile_system = true;
+    m_hgt_mode = true;
+
+    /* Position camera above center */
+    auto lc = m_proj.project(center_lat, center_lon);
+    camera.position = glm::vec3(lc.x, 2000.0f, lc.z);
+    camera.pitch = -30.0f;
+    camera.rotate(0, 0);
+
+    LOG_INFO("HGT mode ready, camera at (%.0f, %.0f, %.0f)",
+             camera.position.x, camera.position.y, camera.position.z);
+    return true;
 }
 
 bool App::set_terrain(const mesh3d_grid_f32_t& grid, const mesh3d_bounds_t& bounds) {
@@ -210,9 +223,13 @@ void App::frame(float dt) {
     handle_toggles();
     m_input.update(camera, dt);
 
-    /* Update tile system (fetches/uploads missing tiles) */
+    /* Update tile system */
     if (scene.use_tile_system) {
-        scene.tile_manager.update();
+        if (m_hgt_mode) {
+            scene.tile_manager.update(camera, m_proj);
+        } else {
+            scene.tile_manager.update();
+        }
     }
 
     float aspect = static_cast<float>(m_width) / std::max(m_height, 1);
@@ -221,53 +238,7 @@ void App::frame(float dt) {
     SDL_GL_SwapWindow(m_window);
 }
 
-void App::generate_demo_scene() {
-    LOG_INFO("Generating synthetic demo terrain...");
-    scene.bounds = {34.0, 34.1, -118.3, -118.2}; // ~11km area
-    scene.grid_rows = 128;
-    scene.grid_cols = 128;
-    generate_synthetic_terrain(scene.elevation, scene.grid_rows, scene.grid_cols);
-
-    /* Add some synthetic nodes */
-    GeoProjection proj;
-    proj.init(scene.bounds);
-
-    auto add = [&](const char* name, double lat, double lon, double alt, int role, float range_km) {
-        NodeData nd;
-        std::memset(&nd.info, 0, sizeof(nd.info));
-        nd.info.id = static_cast<int>(scene.nodes.size() + 1);
-        std::strncpy(nd.info.name, name, sizeof(nd.info.name) - 1);
-        nd.info.lat = lat;
-        nd.info.lon = lon;
-        nd.info.alt = alt;
-        nd.info.antenna_height_m = 10.0f;
-        nd.info.role = role;
-        nd.info.max_range_km = range_km;
-        auto lc = proj.project(lat, lon);
-        nd.world_pos = glm::vec3(lc.x, static_cast<float>(alt + 10.0f), lc.z);
-        scene.nodes.push_back(nd);
-    };
-
-    add("Gateway",  34.050, -118.250, 280.0, 0, 8.0f);
-    add("Relay-A",  34.060, -118.240, 250.0, 1, 5.0f);
-    add("Relay-B",  34.040, -118.260, 260.0, 1, 5.0f);
-    add("Leaf-1",   34.070, -118.230, 220.0, 2, 3.0f);
-    add("Leaf-2",   34.035, -118.270, 230.0, 2, 3.0f);
-
-    scene.rebuild_all();
-
-    /* Position camera above center */
-    camera.position = glm::vec3(0, 800, 2000);
-    camera.pitch = -20.0f;
-    camera.rotate(0, 0);
-}
-
 void App::run() {
-    /* If no terrain loaded, generate demo */
-    if (scene.elevation.empty()) {
-        generate_demo_scene();
-    }
-
     Uint64 last = SDL_GetPerformanceCounter();
     Uint64 freq = SDL_GetPerformanceFrequency();
 

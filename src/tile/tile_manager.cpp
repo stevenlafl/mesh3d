@@ -1,5 +1,7 @@
 #include "tile/tile_manager.h"
+#include "tile/hgt_provider.h"
 #include "tile/url_tile_provider.h"
+#include "camera/camera.h"
 #include "util/log.h"
 #include <cstring>
 #include <algorithm>
@@ -33,9 +35,11 @@ void TileManager::set_imagery_source(ImagerySource src) {
         break;
     }
 
-    /* Clear cache so tiles get rebuilt with new imagery (or without) */
-    m_cache.clear();
-    m_elev_loaded = false;
+    /* Strip textures from ALL cached tiles so they get new imagery,
+       but keep the geometry (meshes) intact to avoid re-reading HGT data. */
+    m_cache.for_each_mut([](TileRenderable& tr) {
+        tr.texture = Texture();
+    });
 
     const char* names[] = {"satellite", "street", "none"};
     LOG_INFO("Imagery source: %s", names[static_cast<int>(src)]);
@@ -108,32 +112,34 @@ void TileManager::ensure_imagery_tiles() {
 void TileManager::composite_imagery_for_tile(TileRenderable* tr) {
     if (!m_imagery_provider || !tr) return;
 
-    /* For the single-tile case, we need to composite multiple imagery tiles
-       into one texture matching the elevation tile's UV space.
-       The elevation tile covers m_bounds, and each imagery tile covers a sub-region. */
-
-    auto imagery_coords = m_selector.select(tr->bounds);
-    if (imagery_coords.empty()) return;
-
-    /* Determine composite image size based on number of tiles */
-    int tiles_x = 0, tiles_y = 0;
-    int min_x = imagery_coords[0].x, max_x = imagery_coords[0].x;
-    int min_y = imagery_coords[0].y, max_y = imagery_coords[0].y;
-    for (auto& c : imagery_coords) {
-        if (c.x < min_x) min_x = c.x;
-        if (c.x > max_x) max_x = c.x;
-        if (c.y < min_y) min_y = c.y;
-        if (c.y > max_y) max_y = c.y;
-    }
-    tiles_x = max_x - min_x + 1;
-    tiles_y = max_y - min_y + 1;
-
-    /* Limit composite size to avoid huge textures */
+    /* Find a zoom level where the tile fits within MAX_COMPOSITE_DIM.
+       Start from the selector's preferred zoom and reduce if needed. */
     static constexpr int MAX_COMPOSITE_DIM = 16; // 16x16 tiles = 4096x4096
-    if (tiles_x > MAX_COMPOSITE_DIM || tiles_y > MAX_COMPOSITE_DIM) {
-        LOG_WARN("Too many imagery tiles (%dx%d), skipping composite", tiles_x, tiles_y);
-        return;
+
+    int zoom = m_selector.fixed_zoom;
+    std::vector<TileCoord> imagery_coords;
+    int min_x, max_x, min_y, max_y, tiles_x, tiles_y;
+
+    while (zoom >= 0) {
+        imagery_coords = bounds_to_tile_range(tr->bounds, zoom);
+        if (imagery_coords.empty()) return;
+
+        min_x = imagery_coords[0].x; max_x = min_x;
+        min_y = imagery_coords[0].y; max_y = min_y;
+        for (auto& c : imagery_coords) {
+            if (c.x < min_x) min_x = c.x;
+            if (c.x > max_x) max_x = c.x;
+            if (c.y < min_y) min_y = c.y;
+            if (c.y > max_y) max_y = c.y;
+        }
+        tiles_x = max_x - min_x + 1;
+        tiles_y = max_y - min_y + 1;
+
+        if (tiles_x <= MAX_COMPOSITE_DIM && tiles_y <= MAX_COMPOSITE_DIM)
+            break;
+        --zoom;
     }
+    if (zoom < 0) return;
 
     int tile_px = 256; // standard slippy tile size
     int comp_w = tiles_x * tile_px;
@@ -173,16 +179,81 @@ void TileManager::composite_imagery_for_tile(TileRenderable* tr) {
 }
 
 void TileManager::render(DrawFn fn) const {
-    for (auto& coord : m_visible_elev) {
-        auto it_check = const_cast<TileCache&>(m_cache).get(coord);
-        if (it_check && it_check->mesh.valid()) {
-            fn(*it_check);
+    if (m_hgt_provider) {
+        /* HGT mode: render everything in the cache */
+        m_cache.for_each([&](const TileRenderable& tr) {
+            if (tr.mesh.valid()) fn(tr);
+        });
+    } else {
+        for (auto& coord : m_visible_elev) {
+            auto it_check = const_cast<TileCache&>(m_cache).get(coord);
+            if (it_check && it_check->mesh.valid()) {
+                fn(*it_check);
+            }
         }
     }
 }
 
 bool TileManager::has_terrain() const {
     return m_elev_loaded && !m_visible_elev.empty();
+}
+
+void TileManager::set_hgt_provider(std::unique_ptr<HgtProvider> provider) {
+    m_hgt_provider = std::move(provider);
+    m_elev_loaded = false;
+    LOG_INFO("HGT provider set on tile manager");
+}
+
+void TileManager::update(const Camera& cam, const GeoProjection& proj) {
+    if (!m_hgt_provider) {
+        update(); // fallback to static mode
+        return;
+    }
+
+    LatLon ll = proj.unproject(cam.position.x, cam.position.z);
+    update_dynamic_tiles(ll.lat, ll.lon);
+    ensure_imagery_tiles();
+}
+
+void TileManager::update_dynamic_tiles(double cam_lat, double cam_lon) {
+    auto needed = m_hgt_provider->tiles_in_view(cam_lat, cam_lon);
+
+    /* Don't evict — let LRU cache handle expiry naturally.
+       This prevents thrashing when the camera oscillates near a tile edge. */
+
+    /* Fetch and upload new tiles */
+    for (auto& coord : needed) {
+        if (m_cache.has(coord)) {
+            m_cache.touch(coord);
+            continue;
+        }
+
+        auto data = m_hgt_provider->fetch_tile(coord);
+        if (!data) continue;
+
+        TileRenderable tr = m_builder.build(*data, m_proj);
+        m_cache.upload(std::move(tr));
+        LOG_INFO("Uploaded HGT tile %s", HgtProvider::coord_to_filename(coord).c_str());
+    }
+
+    m_visible_elev = needed;
+    m_elev_loaded = true;
+
+    /* Update bounds to cover all visible tiles */
+    if (!m_visible_elev.empty()) {
+        mesh3d_bounds_t total;
+        auto first_b = HgtProvider::hgt_tile_bounds(m_visible_elev[0]);
+        total = first_b;
+        for (size_t i = 1; i < m_visible_elev.size(); ++i) {
+            auto b = HgtProvider::hgt_tile_bounds(m_visible_elev[i]);
+            total.min_lat = std::min(total.min_lat, b.min_lat);
+            total.max_lat = std::max(total.max_lat, b.max_lat);
+            total.min_lon = std::min(total.min_lon, b.min_lon);
+            total.max_lon = std::max(total.max_lon, b.max_lon);
+        }
+        m_bounds = total;
+        m_bounds_set = true;
+    }
 }
 
 void TileManager::clear() {
