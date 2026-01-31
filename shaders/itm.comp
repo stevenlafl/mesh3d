@@ -16,6 +16,8 @@ uniform float uCellMeters;
 uniform float uCableLossDb;
 uniform float uRxSensitivityDbm;
 uniform float uEarthCurveFactor;
+uniform float uRxAntennaGainDbi;
+uniform float uRxCableLossDb;
 
 /* ITM parameters */
 uniform int   uClimate;
@@ -214,7 +216,7 @@ void main() {
 
     /* EIRP and received signal */
     float eirp = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
-    float received = eirp - total_loss;
+    float received = eirp - total_loss + uRxAntennaGainDbi - uRxCableLossDb;
 
     if (received >= uRxSensitivityDbm) {
         imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));

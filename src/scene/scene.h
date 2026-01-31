@@ -53,6 +53,9 @@ struct Scene {
     std::vector<float>   signal_strength; // merged signal (dBm)
     std::vector<uint8_t> overlap_count;
 
+    /* Receiver / display config */
+    mesh3d_rf_config_t rf_config{-130.0f, 1.0f, 2.0f, 2.0f, -130.0f, -80.0f};
+
     /* Tile system */
     TileManager tile_manager;
     bool use_tile_system = false;

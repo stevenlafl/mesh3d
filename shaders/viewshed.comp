@@ -16,6 +16,8 @@ uniform float uCellMeters;
 uniform float uCableLossDb;
 uniform float uRxSensitivityDbm;
 uniform float uEarthCurveFactor; // 1.0 / (2 * 4/3 * 6371000)
+uniform float uRxAntennaGainDbi;
+uniform float uRxCableLossDb;
 
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
@@ -100,7 +102,7 @@ void main() {
         }
     }
 
-    float received = eirp - fspl - diff_loss_db;
+    float received = eirp - fspl - diff_loss_db + uRxAntennaGainDbi - uRxCableLossDb;
 
     /* Visibility: 1 = signal reaches receiver above sensitivity.
        Signal is always written so the shader can threshold by display range. */

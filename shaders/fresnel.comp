@@ -16,6 +16,8 @@ uniform float uCellMeters;
 uniform float uCableLossDb;
 uniform float uRxSensitivityDbm;
 uniform float uEarthCurveFactor;
+uniform float uRxAntennaGainDbi;
+uniform float uRxCableLossDb;
 uniform float uTargetHeight;     // default 2.0m
 
 const float PI = 3.141592653589793;
@@ -250,7 +252,7 @@ void main() {
                + 32.44;
 
     float eirp = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
-    float received = eirp - fspl - max(diff_loss_db, 0.0);
+    float received = eirp - fspl - max(diff_loss_db, 0.0) + uRxAntennaGainDbi - uRxCableLossDb;
 
     if (received >= uRxSensitivityDbm) {
         imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));

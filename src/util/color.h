@@ -6,8 +6,8 @@ namespace mesh3d {
 
 /* Signal strength (dBm) to RGB color.
    -80 dBm = strong green, -105 dBm = yellow, -130 dBm = red. */
-inline glm::vec3 signal_to_color(float dbm) {
-    float t = std::clamp((dbm - (-130.0f)) / ((-80.0f) - (-130.0f)), 0.0f, 1.0f);
+inline glm::vec3 signal_to_color(float dbm, float min_dbm = -130.0f, float max_dbm = -80.0f) {
+    float t = std::clamp((dbm - min_dbm) / (max_dbm - min_dbm), 0.0f, 1.0f);
     /* green -> yellow -> red */
     float r = (t < 0.5f) ? 1.0f : 1.0f - 2.0f * (t - 0.5f);
     float g = (t < 0.5f) ? 2.0f * t : 1.0f;

@@ -37,6 +37,7 @@ public:
     void cycle_imagery_source();
     void set_propagation_model(mesh3d_prop_model_t model);
     void set_itm_params(const mesh3d_itm_params_t& params);
+    void set_rf_config(const mesh3d_rf_config_t& config);
     void set_dsm_dir(const std::string& dir);
 
     /* Main loop */

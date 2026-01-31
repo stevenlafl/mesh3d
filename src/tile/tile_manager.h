@@ -67,12 +67,14 @@ public:
     /* Compute viewshed overlays on all cached tiles for the given nodes,
        then rebuild tile meshes with the overlay data baked in. */
     void apply_viewshed_overlays(const std::vector<NodeData>& nodes,
-                                  const GeoProjection& proj);
+                                  const GeoProjection& proj,
+                                  const mesh3d_rf_config_t& rf_config);
 
     /* GPU-accelerated version of apply_viewshed_overlays */
     void apply_viewshed_overlays_gpu(const std::vector<NodeData>& nodes,
                                       const GeoProjection& proj,
-                                      class GpuViewshed* gpu);
+                                      class GpuViewshed* gpu,
+                                      const mesh3d_rf_config_t& rf_config);
 
     /* Start/stop the background I/O thread */
     void start_loader();

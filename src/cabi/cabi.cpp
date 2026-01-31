@@ -67,6 +67,10 @@ void mesh3d_set_itm_params(mesh3d_itm_params_t params) {
     app().set_itm_params(params);
 }
 
+void mesh3d_set_rf_config(mesh3d_rf_config_t config) {
+    app().set_rf_config(config);
+}
+
 void mesh3d_set_dsm_dir(const char* dir) {
     app().set_dsm_dir(dir ? dir : "");
 }

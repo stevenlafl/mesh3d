@@ -81,7 +81,9 @@ void Renderer::opaque_pass(const Scene& scene, const Camera& cam, float aspect) 
         setup_common_uniforms(terrain_shader, cam, aspect);
         terrain_shader.set_int("uOverlayMode", static_cast<int>(scene.overlay_mode));
         terrain_shader.set_vec3("uLightDir", glm::normalize(glm::vec3(0.3f, 1.0f, 0.5f)));
-        terrain_shader.set_float("uRxSensitivity", -132.0f); // default
+        terrain_shader.set_float("uRxSensitivity", scene.rf_config.rx_sensitivity_dbm);
+        terrain_shader.set_float("uDisplayMinDbm", scene.rf_config.display_min_dbm);
+        terrain_shader.set_float("uDisplayMaxDbm", scene.rf_config.display_max_dbm);
         const_cast<TileManager&>(scene.tile_manager).render([&](const TileRenderable& tile) {
             terrain_shader.set_mat4("uModel", tile.model);
             terrain_shader.set_int("uUseSatelliteTex", tile.texture.valid() ? 1 : 0);
@@ -109,7 +111,9 @@ void Renderer::opaque_pass(const Scene& scene, const Camera& cam, float aspect) 
         terrain_shader.set_int("uUseSatelliteTex", scene.satellite_tex.valid() ? 1 : 0);
         terrain_shader.set_int("uUseOverlayTex", 0);
         terrain_shader.set_vec3("uLightDir", glm::normalize(glm::vec3(0.3f, 1.0f, 0.5f)));
-        terrain_shader.set_float("uRxSensitivity", -132.0f); // default
+        terrain_shader.set_float("uRxSensitivity", scene.rf_config.rx_sensitivity_dbm);
+        terrain_shader.set_float("uDisplayMinDbm", scene.rf_config.display_min_dbm);
+        terrain_shader.set_float("uDisplayMaxDbm", scene.rf_config.display_max_dbm);
         if (scene.satellite_tex.valid()) {
             scene.satellite_tex.bind(0);
             terrain_shader.set_int("uSatelliteTex", 0);

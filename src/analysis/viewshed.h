@@ -23,7 +23,8 @@ void compute_viewshed(const float* elevation, int rows, int cols,
                       const mesh3d_bounds_t& bounds,
                       const NodeData& node,
                       std::vector<uint8_t>& visibility,
-                      std::vector<float>& signal);
+                      std::vector<float>& signal,
+                      const mesh3d_rf_config_t& rf_config);
 
 /* Recompute merged viewshed/signal for all nodes in the scene,
    then rebuild the terrain mesh. Uses scene.elevation grid.

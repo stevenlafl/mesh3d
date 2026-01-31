@@ -249,6 +249,15 @@ void App::set_itm_params(const mesh3d_itm_params_t& params) {
     m_gpu_viewshed.set_itm_params(params);
 }
 
+void App::set_rf_config(const mesh3d_rf_config_t& config) {
+    scene.rf_config = config;
+    m_gpu_viewshed.set_rf_config(config);
+    LOG_INFO("RF config: rx_sens=%.0f rx_h=%.1f rx_gain=%.1f rx_loss=%.1f disp=[%.0f,%.0f]",
+             config.rx_sensitivity_dbm, config.rx_height_agl_m,
+             config.rx_antenna_gain_dbi, config.rx_cable_loss_db,
+             config.display_min_dbm, config.display_max_dbm);
+}
+
 void App::set_dsm_dir(const std::string& dir) {
     if (dir.empty()) return;
     auto dsm = std::make_unique<DSMProvider>();
@@ -353,6 +362,11 @@ void App::handle_menu_input() {
             SDL_PushEvent(&quit_ev);
         } else if (result == 4) {
             // Kick async viewshed recompute
+            kick_viewshed_recompute(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
+            m_viewshed_pending = true;
+        } else if (result == 5) {
+            // Apply RF config + kick viewshed
+            m_gpu_viewshed.set_rf_config(scene.rf_config);
             kick_viewshed_recompute(scene, m_proj, m_has_compute ? &m_gpu_viewshed : nullptr);
             m_viewshed_pending = true;
         }

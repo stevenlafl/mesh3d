@@ -11,6 +11,8 @@ uniform int uUseSatelliteTex;
 uniform sampler2D uSatelliteTex;
 uniform vec3 uLightDir;
 uniform float uRxSensitivity; // dBm, for link margin overlay
+uniform float uDisplayMinDbm; // bottom of signal color scale
+uniform float uDisplayMaxDbm; // top of signal color scale
 
 // GPU overlay textures (avoids mesh rebuild)
 uniform int uUseOverlayTex;
@@ -20,7 +22,7 @@ uniform sampler2D uOverlaySigTex;  // R32F: dBm value
 out vec4 FragColor;
 
 vec3 signalColor(float dbm) {
-    float t = clamp((dbm - (-130.0)) / ((-80.0) - (-130.0)), 0.0, 1.0);
+    float t = clamp((dbm - uDisplayMinDbm) / (uDisplayMaxDbm - uDisplayMinDbm), 0.0, 1.0);
     // red(weak) -> yellow(mid) -> green(strong)
     vec3 c;
     if (t < 0.5) {
@@ -68,7 +70,7 @@ void main() {
     // Overlay — only draw where cell is visible and signal is within display range.
     // Display minimum: -130 dBm (bottom of signal color scale).
     // Areas below this threshold are left as clean map/terrain.
-    float displayMin = -130.0;
+    float displayMin = uDisplayMinDbm;
 
     if (uOverlayMode == 1) {
         // Viewshed: tint covered areas green

@@ -26,6 +26,13 @@ enum class MenuField {
     JUMP_BUTTON,
     CAM_SPEED,
     CAM_SPEED_BUTTON,
+    RF_SENS,
+    RF_HEIGHT,
+    RF_GAIN,
+    RF_CABLE_LOSS,
+    RF_DISP_MIN,
+    RF_DISP_MAX,
+    RF_APPLY,
     NODE_LIST_START, // first node row; add node_index to get specific row
     RESUME,
     QUIT
@@ -42,6 +49,20 @@ struct MenuState {
     bool lon_active = false;
     bool speed_active = false;
 
+    /* RF config input fields */
+    std::string rf_sens_input;
+    std::string rf_height_input;
+    std::string rf_gain_input;
+    std::string rf_cable_loss_input;
+    std::string rf_disp_min_input;
+    std::string rf_disp_max_input;
+    bool rf_sens_active = false;
+    bool rf_height_active = false;
+    bool rf_gain_active = false;
+    bool rf_cable_loss_active = false;
+    bool rf_disp_min_active = false;
+    bool rf_disp_max_active = false;
+
     /* Node list */
     int scroll_offset = 0;
     int editing_node = -1;        // index into scene.nodes, -1 = none
@@ -50,7 +71,7 @@ struct MenuState {
 
     /* Focus tracking */
     int focused_field = 0; // simple linear index for arrow key nav
-    static constexpr int FIELD_COUNT_FIXED = 7; // lat, lon, jump, speed, apply, resume, quit
+    static constexpr int FIELD_COUNT_FIXED = 14; // lat, lon, jump, speed, apply, rf(6)+apply, resume, quit
 };
 
 class Hud {

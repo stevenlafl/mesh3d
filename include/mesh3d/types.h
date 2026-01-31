@@ -50,6 +50,15 @@ typedef struct {
     float time_pct;             /* time % (50-99) */
 } mesh3d_itm_params_t;
 
+typedef struct {
+    float rx_sensitivity_dbm;   /* -130.0 */
+    float rx_height_agl_m;      /* 1.0 */
+    float rx_antenna_gain_dbi;  /* 2.0 */
+    float rx_cable_loss_db;     /* 2.0 */
+    float display_min_dbm;      /* -130.0 (bottom of signal color scale) */
+    float display_max_dbm;      /* -80.0  (top of signal color scale) */
+} mesh3d_rf_config_t;
+
 typedef enum {
     MESH3D_PROP_FSPL    = 0,  /* free-space path loss (current) */
     MESH3D_PROP_ITM     = 1,  /* Longley-Rice ITM */

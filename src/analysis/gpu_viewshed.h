@@ -34,6 +34,9 @@ public:
     /* Set ITM parameters for ITM propagation model */
     void set_itm_params(const mesh3d_itm_params_t& params);
 
+    /* Set receiver / display config */
+    void set_rf_config(const mesh3d_rf_config_t& config);
+
     /* Compute viewshed for all nodes, merging results on GPU (blocking) */
     void compute_all(const std::vector<NodeData>& nodes);
 
@@ -90,6 +93,9 @@ private:
     /* Propagation model selection */
     mesh3d_prop_model_t m_prop_model = MESH3D_PROP_ITM;
     mesh3d_itm_params_t m_itm_params{5, 15.0f, 0.005f, 1, 50.0f, 50.0f};
+
+    /* Receiver / display config */
+    mesh3d_rf_config_t m_rf_config{-130.0f, 1.0f, 2.0f, 2.0f, -130.0f, -80.0f};
 
     bool m_initialized = false;
     bool m_has_itm = false;

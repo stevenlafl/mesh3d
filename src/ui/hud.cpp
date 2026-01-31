@@ -347,6 +347,34 @@ void Hud::draw_menu(int screen_w, int screen_h, const Scene& scene,
     draw_text("[Apply]", lx, ly, btn, 1.0f, screen_w, screen_h);
     ly += lh * 1.3f; field++;
 
+    /* Receiver / Display section */
+    draw_text("Receiver / Display", lx, ly, hdr, 1.0f, screen_w, screen_h);
+    ly += lh;
+
+    auto draw_rf_field = [&](const char* label, const std::string& input, bool active, float current) {
+        if (m_menu.focused_field == field)
+            draw_rect(lx - 4, ly - 4, pw - 40, lh, sel, screen_w, screen_h);
+        std::string disp = std::string(label) + ": [" + (input.empty() ? "___" : input);
+        if (active) disp += "_";
+        snprintf(buf, sizeof(buf), "]  (%.1f)", current);
+        disp += buf;
+        draw_text(disp, lx, ly, active ? val : lbl, 1.0f, screen_w, screen_h);
+        ly += lh; field++;
+    };
+
+    draw_rf_field("RX Sensitivity", m_menu.rf_sens_input, m_menu.rf_sens_active, scene.rf_config.rx_sensitivity_dbm);
+    draw_rf_field("RX Height (m)", m_menu.rf_height_input, m_menu.rf_height_active, scene.rf_config.rx_height_agl_m);
+    draw_rf_field("RX Ant Gain", m_menu.rf_gain_input, m_menu.rf_gain_active, scene.rf_config.rx_antenna_gain_dbi);
+    draw_rf_field("RX Cable Loss", m_menu.rf_cable_loss_input, m_menu.rf_cable_loss_active, scene.rf_config.rx_cable_loss_db);
+    draw_rf_field("Display Min dBm", m_menu.rf_disp_min_input, m_menu.rf_disp_min_active, scene.rf_config.display_min_dbm);
+    draw_rf_field("Display Max dBm", m_menu.rf_disp_max_input, m_menu.rf_disp_max_active, scene.rf_config.display_max_dbm);
+
+    // Apply RF button
+    if (m_menu.focused_field == field)
+        draw_rect(lx - 4, ly - 4, 120, lh, sel, screen_w, screen_h);
+    draw_text("[Apply RF]", lx, ly, btn, 1.0f, screen_w, screen_h);
+    ly += lh * 1.3f; field++;
+
     /* Node list section */
     draw_text("Nodes", lx, ly, hdr, 1.0f, screen_w, screen_h);
     ly += lh;
@@ -455,7 +483,7 @@ void Hud::draw_signal_scale(int screen_w, int screen_h, const Scene& scene) {
     float seg_h = bar_h / segments;
 
     if (scene.overlay_mode == MESH3D_OVERLAY_SIGNAL) {
-        /* Signal: -80 (top, green) to -130 (bottom, red) */
+        /* Signal: max (top, green) to min (bottom, red) */
         for (int i = 0; i < segments; ++i) {
             float t = 1.0f - static_cast<float>(i) / (segments - 1); // 1 at top, 0 at bottom
             glm::vec3 c;
@@ -471,9 +499,16 @@ void Hud::draw_signal_scale(int screen_w, int screen_h, const Scene& scene) {
         /* Labels */
         glm::vec4 lbl(0.85f, 0.85f, 0.85f, 1.0f);
         float lx = bx + bar_w + 6.0f;
-        draw_text("-80",  lx, by, lbl, 0.85f, screen_w, screen_h);
-        draw_text("-105", lx, by + bar_h * 0.5f - m_line_height * 0.5f, lbl, 0.85f, screen_w, screen_h);
-        draw_text("-130", lx, by + bar_h - m_line_height, lbl, 0.85f, screen_w, screen_h);
+        char top_buf[16], mid_buf[16], bot_buf[16];
+        float disp_max = scene.rf_config.display_max_dbm;
+        float disp_min = scene.rf_config.display_min_dbm;
+        float disp_mid = (disp_max + disp_min) * 0.5f;
+        snprintf(top_buf, sizeof(top_buf), "%.0f", disp_max);
+        snprintf(mid_buf, sizeof(mid_buf), "%.0f", disp_mid);
+        snprintf(bot_buf, sizeof(bot_buf), "%.0f", disp_min);
+        draw_text(top_buf, lx, by, lbl, 0.85f, screen_w, screen_h);
+        draw_text(mid_buf, lx, by + bar_h * 0.5f - m_line_height * 0.5f, lbl, 0.85f, screen_w, screen_h);
+        draw_text(bot_buf, lx, by + bar_h - m_line_height, lbl, 0.85f, screen_w, screen_h);
     } else {
         /* Link margin: +20dB (top, green) to 0dB (bottom, red), <0 = black */
         for (int i = 0; i < segments; ++i) {
@@ -595,31 +630,50 @@ void Hud::render(int screen_w, int screen_h,
 
 /* Menu text input */
 void Hud::menu_text_input(char c) {
-    if (m_menu.lat_active) {
-        if ((c >= '0' && c <= '9') || c == '.' || c == '-')
-            m_menu.lat_input += c;
-    } else if (m_menu.lon_active) {
-        if ((c >= '0' && c <= '9') || c == '.' || c == '-')
-            m_menu.lon_input += c;
-    } else if (m_menu.speed_active) {
-        if ((c >= '0' && c <= '9') || c == '.')
-            m_menu.speed_input += c;
-    }
+    auto try_numeric = [&](bool active, std::string& input, bool allow_neg = true) -> bool {
+        if (!active) return false;
+        if ((c >= '0' && c <= '9') || c == '.' || (allow_neg && c == '-'))
+            input += c;
+        return true;
+    };
+    if (try_numeric(m_menu.lat_active, m_menu.lat_input)) return;
+    if (try_numeric(m_menu.lon_active, m_menu.lon_input)) return;
+    if (try_numeric(m_menu.speed_active, m_menu.speed_input, false)) return;
+    if (try_numeric(m_menu.rf_sens_active, m_menu.rf_sens_input)) return;
+    if (try_numeric(m_menu.rf_height_active, m_menu.rf_height_input, false)) return;
+    if (try_numeric(m_menu.rf_gain_active, m_menu.rf_gain_input)) return;
+    if (try_numeric(m_menu.rf_cable_loss_active, m_menu.rf_cable_loss_input, false)) return;
+    if (try_numeric(m_menu.rf_disp_min_active, m_menu.rf_disp_min_input)) return;
+    if (try_numeric(m_menu.rf_disp_max_active, m_menu.rf_disp_max_input)) return;
 }
 
 void Hud::menu_backspace() {
-    if (m_menu.lat_active && !m_menu.lat_input.empty())
-        m_menu.lat_input.pop_back();
-    else if (m_menu.lon_active && !m_menu.lon_input.empty())
-        m_menu.lon_input.pop_back();
-    else if (m_menu.speed_active && !m_menu.speed_input.empty())
-        m_menu.speed_input.pop_back();
+    auto try_pop = [](bool active, std::string& input) -> bool {
+        if (!active || input.empty()) return false;
+        input.pop_back();
+        return true;
+    };
+    if (try_pop(m_menu.lat_active, m_menu.lat_input)) return;
+    if (try_pop(m_menu.lon_active, m_menu.lon_input)) return;
+    if (try_pop(m_menu.speed_active, m_menu.speed_input)) return;
+    if (try_pop(m_menu.rf_sens_active, m_menu.rf_sens_input)) return;
+    if (try_pop(m_menu.rf_height_active, m_menu.rf_height_input)) return;
+    if (try_pop(m_menu.rf_gain_active, m_menu.rf_gain_input)) return;
+    if (try_pop(m_menu.rf_cable_loss_active, m_menu.rf_cable_loss_input)) return;
+    if (try_pop(m_menu.rf_disp_min_active, m_menu.rf_disp_min_input)) return;
+    if (try_pop(m_menu.rf_disp_max_active, m_menu.rf_disp_max_input)) return;
 }
 
 void Hud::menu_navigate(int dir) {
     m_menu.lat_active = false;
     m_menu.lon_active = false;
     m_menu.speed_active = false;
+    m_menu.rf_sens_active = false;
+    m_menu.rf_height_active = false;
+    m_menu.rf_gain_active = false;
+    m_menu.rf_cable_loss_active = false;
+    m_menu.rf_disp_min_active = false;
+    m_menu.rf_disp_max_active = false;
 
     if (m_menu.device_select_node >= 0) {
         // In device selection mode, up/down confirm and move
@@ -638,6 +692,12 @@ int Hud::menu_activate(Scene& scene, Camera& cam, GeoProjection& proj) {
     m_menu.lat_active = false;
     m_menu.lon_active = false;
     m_menu.speed_active = false;
+    m_menu.rf_sens_active = false;
+    m_menu.rf_height_active = false;
+    m_menu.rf_gain_active = false;
+    m_menu.rf_cable_loss_active = false;
+    m_menu.rf_disp_min_active = false;
+    m_menu.rf_disp_max_active = false;
 
     // Check if in device selection mode
     if (m_menu.device_select_node >= 0) {
@@ -689,18 +749,40 @@ int Hud::menu_activate(Scene& scene, Camera& cam, GeoProjection& proj) {
         return 3;
     }
 
+    // RF config fields (5-11)
+    if (f == 5) { m_menu.rf_sens_active = true; return 3; }
+    if (f == 6) { m_menu.rf_height_active = true; return 3; }
+    if (f == 7) { m_menu.rf_gain_active = true; return 3; }
+    if (f == 8) { m_menu.rf_cable_loss_active = true; return 3; }
+    if (f == 9) { m_menu.rf_disp_min_active = true; return 3; }
+    if (f == 10) { m_menu.rf_disp_max_active = true; return 3; }
+    // Apply RF button
+    if (f == 11) {
+        auto parse_or = [](const std::string& s, float def) -> float {
+            if (s.empty()) return def;
+            return static_cast<float>(std::atof(s.c_str()));
+        };
+        scene.rf_config.rx_sensitivity_dbm = parse_or(m_menu.rf_sens_input, scene.rf_config.rx_sensitivity_dbm);
+        scene.rf_config.rx_height_agl_m = parse_or(m_menu.rf_height_input, scene.rf_config.rx_height_agl_m);
+        scene.rf_config.rx_antenna_gain_dbi = parse_or(m_menu.rf_gain_input, scene.rf_config.rx_antenna_gain_dbi);
+        scene.rf_config.rx_cable_loss_db = parse_or(m_menu.rf_cable_loss_input, scene.rf_config.rx_cable_loss_db);
+        scene.rf_config.display_min_dbm = parse_or(m_menu.rf_disp_min_input, scene.rf_config.display_min_dbm);
+        scene.rf_config.display_max_dbm = parse_or(m_menu.rf_disp_max_input, scene.rf_config.display_max_dbm);
+        LOG_INFO("RF config applied: sens=%.0f h=%.1f gain=%.1f loss=%.1f disp=[%.0f,%.0f]",
+                 scene.rf_config.rx_sensitivity_dbm, scene.rf_config.rx_height_agl_m,
+                 scene.rf_config.rx_antenna_gain_dbi, scene.rf_config.rx_cable_loss_db,
+                 scene.rf_config.display_min_dbm, scene.rf_config.display_max_dbm);
+        return 5; // signal App to apply RF config + kick viewshed
+    }
+
     // Node list fields
-    int node_field_start = 5;
+    int node_field_start = 12;
     int node_count = std::min((int)scene.nodes.size(), 8);
     if (f >= node_field_start && f < node_field_start + node_count) {
         int ni = m_menu.scroll_offset + (f - node_field_start);
         if (ni >= 0 && ni < (int)scene.nodes.size()) {
-            // Check if clicking on [X] area (rightmost) — we approximate:
-            // For simplicity, Enter on a node row toggles edit/device select mode
             if (m_menu.editing_node == ni) {
-                // Already editing — enter device select mode
                 m_menu.device_select_node = ni;
-                // Find current device index
                 m_menu.device_select_idx = 0;
                 auto& nd = scene.nodes[ni];
                 for (int p = 0; p < HARDWARE_PROFILE_COUNT; ++p) {
@@ -729,11 +811,11 @@ int Hud::menu_activate(Scene& scene, Camera& cam, GeoProjection& proj) {
 
 int Hud::total_menu_fields(const Scene& scene) const {
     int node_count = std::min((int)scene.nodes.size(), 8);
-    return 5 + node_count + 2; // lat, lon, jump, speed, apply, nodes..., resume, quit
+    return 12 + node_count + 2; // lat,lon,jump,speed,apply,rf(6)+apply,nodes...,resume,quit
 }
 
 bool Hud::is_node_field(int field, const Scene& scene, int& node_idx) const {
-    int node_field_start = 5;
+    int node_field_start = 12;
     int node_count = std::min((int)scene.nodes.size(), 8);
     if (field >= node_field_start && field < node_field_start + node_count) {
         node_idx = m_menu.scroll_offset + (field - node_field_start);

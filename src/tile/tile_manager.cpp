@@ -445,7 +445,8 @@ static void extract_center_results(const CompositeElevation& ce,
 }
 
 void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
-                                           const GeoProjection& proj) {
+                                           const GeoProjection& proj,
+                                           const mesh3d_rf_config_t& rf_config) {
     /* Iterate all cached tiles, compute viewshed on composite (tile+neighbors) */
     m_cache.for_each_mut([&](TileRenderable& tr) {
         if (tr.elevation.empty() || tr.elev_rows < 2 || tr.elev_cols < 2)
@@ -462,7 +463,7 @@ void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
             std::vector<uint8_t> vis;
             std::vector<float> sig;
             compute_viewshed(ce.data.data(), ce.rows, ce.cols,
-                             ce.bounds, nd, vis, sig);
+                             ce.bounds, nd, vis, sig, rf_config);
 
             /* Extract center tile results and merge */
             std::vector<uint8_t> tile_vis;
@@ -489,9 +490,10 @@ void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
 
 void TileManager::apply_viewshed_overlays_gpu(const std::vector<NodeData>& nodes,
                                                 const GeoProjection& proj,
-                                                GpuViewshed* gpu) {
+                                                GpuViewshed* gpu,
+                                                const mesh3d_rf_config_t& rf_config) {
     if (!gpu) {
-        apply_viewshed_overlays(nodes, proj);
+        apply_viewshed_overlays(nodes, proj, rf_config);
         return;
     }
 

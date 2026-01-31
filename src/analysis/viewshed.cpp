@@ -11,7 +11,8 @@ void compute_viewshed(const float* elevation, int rows, int cols,
                       const mesh3d_bounds_t& bounds,
                       const NodeData& node,
                       std::vector<uint8_t>& visibility,
-                      std::vector<float>& signal) {
+                      std::vector<float>& signal,
+                      const mesh3d_rf_config_t& rf_config) {
     int total = rows * cols;
     visibility.assign(total, 0);
     signal.assign(total, -999.0f);
@@ -47,7 +48,7 @@ void compute_viewshed(const float* elevation, int rows, int cols,
     if (freq_mhz <= 0) freq_mhz = 906.875f;
     float cable_loss = node.info.cable_loss_db;
     float rx_sens = node.info.rx_sensitivity_dbm;
-    if (rx_sens >= 0) rx_sens = -132.0f; // default
+    if (rx_sens >= 0) rx_sens = rf_config.rx_sensitivity_dbm;
 
     /* Max range: full grid diagonal — let signal attenuation handle clipping */
     float eirp = tx_power_dbm + antenna_gain - cable_loss;
@@ -127,7 +128,7 @@ void compute_viewshed(const float* elevation, int rows, int cols,
                 }
             }
 
-            float received = eirp - fspl - diff_loss_db;
+            float received = eirp - fspl - diff_loss_db + rf_config.rx_antenna_gain_dbi - rf_config.rx_cable_loss_db;
 
             /* Visibility based on RX sensitivity threshold */
             if (received >= rx_sens) {
@@ -159,7 +160,7 @@ void recompute_all_viewsheds(Scene& scene, const GeoProjection& proj) {
             std::vector<uint8_t> vis;
             std::vector<float> sig;
             compute_viewshed(scene.elevation.data(), rows, cols,
-                             scene.bounds, nd, vis, sig);
+                             scene.bounds, nd, vis, sig, scene.rf_config);
 
             for (int i = 0; i < total; ++i) {
                 if (vis[i]) {
@@ -183,7 +184,7 @@ void recompute_all_viewsheds(Scene& scene, const GeoProjection& proj) {
 
     /* Tile-based elevation path — compute overlays per cached tile */
     if (scene.use_tile_system) {
-        scene.tile_manager.apply_viewshed_overlays(scene.nodes, proj);
+        scene.tile_manager.apply_viewshed_overlays(scene.nodes, proj, scene.rf_config);
         return;
     }
 
@@ -231,7 +232,7 @@ void recompute_all_viewsheds_gpu(Scene& scene, const GeoProjection& proj,
 
     /* Tile-based elevation path */
     if (scene.use_tile_system) {
-        scene.tile_manager.apply_viewshed_overlays_gpu(scene.nodes, proj, gpu);
+        scene.tile_manager.apply_viewshed_overlays_gpu(scene.nodes, proj, gpu, scene.rf_config);
         return;
     }
 

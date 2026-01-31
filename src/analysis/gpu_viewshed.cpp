@@ -74,6 +74,10 @@ void GpuViewshed::set_itm_params(const mesh3d_itm_params_t& params) {
     m_itm_params = params;
 }
 
+void GpuViewshed::set_rf_config(const mesh3d_rf_config_t& config) {
+    m_rf_config = config;
+}
+
 void GpuViewshed::create_textures(int rows, int cols) {
     if (m_rows == rows && m_cols == cols && m_elevation_tex != 0)
         return; // already allocated at correct size
@@ -237,7 +241,7 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
         if (freq_mhz <= 0) freq_mhz = 906.875f;
         float cable_loss = nd.info.cable_loss_db;
         float rx_sens = nd.info.rx_sensitivity_dbm;
-        if (rx_sens >= 0) rx_sens = -132.0f;
+        if (rx_sens >= 0) rx_sens = m_rf_config.rx_sensitivity_dbm;
 
         /* Max range: full grid diagonal — let signal attenuation handle clipping */
         float eirp = tx_power_dbm + antenna_gain - cable_loss;
@@ -260,6 +264,8 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
         active_shader->set_float("uCableLossDb", cable_loss);
         active_shader->set_float("uRxSensitivityDbm", rx_sens);
         active_shader->set_float("uEarthCurveFactor", earth_curve_factor);
+        active_shader->set_float("uRxAntennaGainDbi", m_rf_config.rx_antenna_gain_dbi);
+        active_shader->set_float("uRxCableLossDb", m_rf_config.rx_cable_loss_db);
 
         /* ITM-specific uniforms */
         if (m_prop_model == MESH3D_PROP_ITM && m_has_itm) {
@@ -267,12 +273,12 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
             active_shader->set_float("uGroundDielectric", m_itm_params.ground_dielectric);
             active_shader->set_float("uGroundConductivity", m_itm_params.ground_conductivity);
             active_shader->set_int("uPolarization", m_itm_params.polarization);
-            active_shader->set_float("uTargetHeight", 2.0f);
+            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
         }
 
         /* Fresnel-specific uniforms */
         if (m_prop_model == MESH3D_PROP_FRESNEL && m_has_fresnel) {
-            active_shader->set_float("uTargetHeight", 2.0f);
+            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
         }
 
         glBindImageTexture(0, m_elevation_tex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
@@ -341,7 +347,7 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
         if (freq_mhz <= 0) freq_mhz = 906.875f;
         float cable_loss = nd.info.cable_loss_db;
         float rx_sens = nd.info.rx_sensitivity_dbm;
-        if (rx_sens >= 0) rx_sens = -132.0f;
+        if (rx_sens >= 0) rx_sens = m_rf_config.rx_sensitivity_dbm;
 
         /* Max range: full grid diagonal — let signal attenuation handle clipping */
         float eirp = tx_power_dbm + antenna_gain - cable_loss;
@@ -363,17 +369,19 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
         active_shader->set_float("uCableLossDb", cable_loss);
         active_shader->set_float("uRxSensitivityDbm", rx_sens);
         active_shader->set_float("uEarthCurveFactor", earth_curve_factor);
+        active_shader->set_float("uRxAntennaGainDbi", m_rf_config.rx_antenna_gain_dbi);
+        active_shader->set_float("uRxCableLossDb", m_rf_config.rx_cable_loss_db);
 
         if (m_prop_model == MESH3D_PROP_ITM && m_has_itm) {
             active_shader->set_int("uClimate", m_itm_params.climate);
             active_shader->set_float("uGroundDielectric", m_itm_params.ground_dielectric);
             active_shader->set_float("uGroundConductivity", m_itm_params.ground_conductivity);
             active_shader->set_int("uPolarization", m_itm_params.polarization);
-            active_shader->set_float("uTargetHeight", 2.0f);
+            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
         }
 
         if (m_prop_model == MESH3D_PROP_FRESNEL && m_has_fresnel) {
-            active_shader->set_float("uTargetHeight", 2.0f);
+            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
         }
 
         /* Bind viewshed image textures (must be per-iteration — merge pass rebinds units 0-2) */
