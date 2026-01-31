@@ -188,20 +188,93 @@ void GpuViewshed::set_grid_params(const mesh3d_bounds_t& bounds, int rows, int c
     m_cell_meters = (cell_m_lat + cell_m_lon) * 0.5f;
 }
 
+/* -----------------------------------------------------------------------
+ * Environment uniforms: grid geometry + RX config + ITM terrain/climate.
+ * These are constant across all nodes in a single compute pass.
+ * Must be called after active_shader->use().
+ * ----------------------------------------------------------------------- */
+void GpuViewshed::set_environment_uniforms(ComputeShader* shader) {
+    /* Grid geometry */
+    shader->set_ivec2("uGridSize", m_cols, m_rows);
+    shader->set_float("uCellMeters", m_cell_meters);
+    shader->set_float("uEarthCurveFactor", 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f));
+    shader->set_int("uMaxRangeCells", static_cast<int>(
+        std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols))));
+
+    /* RX config (same receiver assumed at every pixel) */
+    shader->set_float("uRxAntennaGainDbi", m_rf_config.rx_antenna_gain_dbi);
+    shader->set_float("uRxCableLossDb", m_rf_config.rx_cable_loss_db);
+    shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
+
+    /* ITM terrain / climate / statistical parameters */
+    if (m_prop_model == MESH3D_PROP_ITM && m_has_itm) {
+        shader->set_int("uClimate", m_itm_params.climate);
+        shader->set_float("uGroundDielectric", m_itm_params.ground_dielectric);
+        shader->set_float("uGroundConductivity", m_itm_params.ground_conductivity);
+        shader->set_int("uPolarization", m_itm_params.polarization);
+        shader->set_float("uRefractivity", m_itm_params.refractivity);
+        shader->set_float("uLocationPct", m_itm_params.location_pct);
+        shader->set_float("uSituationPct", m_itm_params.situation_pct);
+        shader->set_float("uTimePct", m_itm_params.time_pct);
+        shader->set_int("uMdvar", m_itm_params.mdvar);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Per-node TX uniforms: hardware-profile-dependent values that differ
+ * between e.g. a Heltec V3 (22 dBm, 2 dBi) and a Station G2 (30 dBm,
+ * 3 dBi).  These change on every loop iteration.
+ * ----------------------------------------------------------------------- */
+void GpuViewshed::set_node_uniforms(ComputeShader* shader, const NodeData& nd,
+                                     int nc, int nr, float observer_height) {
+    /* Per-node TX hardware profile — each node type has its own values */
+    float tx_power_dbm = nd.info.tx_power_dbm;
+    if (tx_power_dbm <= 0) tx_power_dbm = 22.0f;
+
+    float freq_mhz = nd.info.frequency_mhz;
+    if (freq_mhz <= 0) freq_mhz = 906.875f;
+
+    float rx_sens = nd.info.rx_sensitivity_dbm;
+    if (rx_sens >= 0) rx_sens = m_rf_config.rx_sensitivity_dbm;
+
+    shader->set_ivec2("uNodeCell", nc, nr);
+    shader->set_float("uObserverHeight", observer_height);
+    shader->set_float("uTxPowerDbm", tx_power_dbm);
+    shader->set_float("uAntennaGainDbi", nd.info.antenna_gain_dbi);
+    shader->set_float("uFreqMhz", freq_mhz);
+    shader->set_float("uCableLossDb", nd.info.cable_loss_db);
+    shader->set_float("uRxSensitivityDbm", rx_sens);
+}
+
+/* -----------------------------------------------------------------------
+ * Merge pass: fold this node's per-pixel results into the accumulated
+ * best-signal / any-visible / overlap-count textures.
+ * ----------------------------------------------------------------------- */
+void GpuViewshed::dispatch_merge(GLuint groups_x, GLuint groups_y) {
+    m_merge_shader.use();
+    m_merge_shader.set_ivec2("uGridSize", m_cols, m_rows);
+
+    glBindImageTexture(0, m_node_vis_tex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_R8UI);
+    glBindImageTexture(1, m_node_sig_tex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
+    glBindImageTexture(2, m_merged_vis_tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
+    glBindImageTexture(3, m_merged_sig_tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+    glBindImageTexture(4, m_overlap_tex,    0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
+
+    m_merge_shader.dispatch(groups_x, groups_y, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+}
+
 void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
     if (!m_initialized || m_rows == 0 || m_cols == 0) return;
 
     clear_merge_textures();
 
-    /* Compute workgroup counts (ceil division) */
     GLuint groups_x = (m_cols + 15) / 16;
     GLuint groups_y = (m_rows + 15) / 16;
 
-    /* Precompute grid coordinate mapping */
     double lat_res = (m_bounds.max_lat - m_bounds.min_lat) / (m_rows - 1);
     double lon_res = (m_bounds.max_lon - m_bounds.min_lon) / (m_cols - 1);
 
-    /* Select compute shader based on propagation model */
     ComputeShader* active_shader = &m_viewshed_shader;
     if (m_prop_model == MESH3D_PROP_ITM && m_has_itm)
         active_shader = &m_itm_shader;
@@ -209,15 +282,12 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
         active_shader = &m_fresnel_shader;
 
     for (auto& nd : nodes) {
-        /* Map node to grid cell (may be off-grid for cross-tile bleed) */
         int nr = static_cast<int>((m_bounds.max_lat - nd.info.lat) / lat_res);
         int nc = static_cast<int>((nd.info.lon - m_bounds.min_lon) / lon_res);
 
-        /* Use nearest edge cell for elevation lookup when node is off-grid */
         int nr_elev = std::clamp(nr, 0, m_rows - 1);
         int nc_elev = std::clamp(nc, 0, m_cols - 1);
 
-        /* Read node elevation at grid cell from GPU texture */
         float node_elev = 0.0f;
         {
             GLuint fbo;
@@ -232,54 +302,11 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
 
         float antenna_h = nd.info.antenna_height_m;
         if (antenna_h < 1.0f) antenna_h = 2.0f;
-        float obs_h = node_elev + antenna_h;
-
-        float tx_power_dbm = nd.info.tx_power_dbm;
-        if (tx_power_dbm <= 0) tx_power_dbm = 22.0f;
-        float antenna_gain = nd.info.antenna_gain_dbi;
-        float freq_mhz = nd.info.frequency_mhz;
-        if (freq_mhz <= 0) freq_mhz = 906.875f;
-        float cable_loss = nd.info.cable_loss_db;
-        float rx_sens = nd.info.rx_sensitivity_dbm;
-        if (rx_sens >= 0) rx_sens = m_rf_config.rx_sensitivity_dbm;
-
-        /* Max range: full grid diagonal — let signal attenuation handle clipping */
-        float eirp = tx_power_dbm + antenna_gain - cable_loss;
-        int max_range_cells = static_cast<int>(
-            std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols)));
-
-        /* Earth curvature factor: 1 / (2 * k * Re) where k=4/3, Re=6371000m */
-        float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
 
         /* --- Viewshed pass --- */
         active_shader->use();
-        active_shader->set_ivec2("uGridSize", m_cols, m_rows);
-        active_shader->set_ivec2("uNodeCell", nc, nr);
-        active_shader->set_float("uObserverHeight", obs_h);
-        active_shader->set_int("uMaxRangeCells", max_range_cells);
-        active_shader->set_float("uTxPowerDbm", tx_power_dbm);
-        active_shader->set_float("uAntennaGainDbi", antenna_gain);
-        active_shader->set_float("uFreqMhz", freq_mhz);
-        active_shader->set_float("uCellMeters", m_cell_meters);
-        active_shader->set_float("uCableLossDb", cable_loss);
-        active_shader->set_float("uRxSensitivityDbm", rx_sens);
-        active_shader->set_float("uEarthCurveFactor", earth_curve_factor);
-        active_shader->set_float("uRxAntennaGainDbi", m_rf_config.rx_antenna_gain_dbi);
-        active_shader->set_float("uRxCableLossDb", m_rf_config.rx_cable_loss_db);
-
-        /* ITM-specific uniforms */
-        if (m_prop_model == MESH3D_PROP_ITM && m_has_itm) {
-            active_shader->set_int("uClimate", m_itm_params.climate);
-            active_shader->set_float("uGroundDielectric", m_itm_params.ground_dielectric);
-            active_shader->set_float("uGroundConductivity", m_itm_params.ground_conductivity);
-            active_shader->set_int("uPolarization", m_itm_params.polarization);
-            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
-        }
-
-        /* Fresnel-specific uniforms */
-        if (m_prop_model == MESH3D_PROP_FRESNEL && m_has_fresnel) {
-            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
-        }
+        set_environment_uniforms(active_shader);
+        set_node_uniforms(active_shader, nd, nc, nr, node_elev + antenna_h);
 
         glBindImageTexture(0, m_elevation_tex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
         glBindImageTexture(1, m_node_vis_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
@@ -288,18 +315,8 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
         active_shader->dispatch(groups_x, groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-        /* --- Merge pass --- */
-        m_merge_shader.use();
-        m_merge_shader.set_ivec2("uGridSize", m_cols, m_rows);
-
-        glBindImageTexture(0, m_node_vis_tex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_R8UI);
-        glBindImageTexture(1, m_node_sig_tex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
-        glBindImageTexture(2, m_merged_vis_tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-        glBindImageTexture(3, m_merged_sig_tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-        glBindImageTexture(4, m_overlap_tex,    0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-
-        m_merge_shader.dispatch(groups_x, groups_y, 1);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        /* --- Merge: OR visibility, MAX signal, increment overlap --- */
+        dispatch_merge(groups_x, groups_y);
     }
 }
 
@@ -311,15 +328,12 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
 
     clear_merge_textures();
 
-    /* Compute workgroup counts (ceil division) */
     GLuint groups_x = (m_cols + 15) / 16;
     GLuint groups_y = (m_rows + 15) / 16;
 
-    /* Precompute grid coordinate mapping */
     double lat_res = (m_bounds.max_lat - m_bounds.min_lat) / (m_rows - 1);
     double lon_res = (m_bounds.max_lon - m_bounds.min_lon) / (m_cols - 1);
 
-    /* Select compute shader based on propagation model */
     ComputeShader* active_shader = &m_viewshed_shader;
     if (m_prop_model == MESH3D_PROP_ITM && m_has_itm)
         active_shader = &m_itm_shader;
@@ -327,64 +341,21 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
         active_shader = &m_fresnel_shader;
 
     for (auto& nd : nodes) {
-        /* Map node to grid cell (may be off-grid for cross-tile bleed) */
         int nr = static_cast<int>((m_bounds.max_lat - nd.info.lat) / lat_res);
         int nc = static_cast<int>((nd.info.lon - m_bounds.min_lon) / lon_res);
 
-        /* Use nearest edge cell for elevation lookup when node is off-grid */
         int nr_elev = std::clamp(nr, 0, m_rows - 1);
         int nc_elev = std::clamp(nc, 0, m_cols - 1);
         float node_elev = cpu_elevation[nr_elev * m_cols + nc_elev];
 
         float antenna_h = nd.info.antenna_height_m;
         if (antenna_h < 1.0f) antenna_h = 2.0f;
-        float obs_h = node_elev + antenna_h;
-
-        float tx_power_dbm = nd.info.tx_power_dbm;
-        if (tx_power_dbm <= 0) tx_power_dbm = 22.0f;
-        float antenna_gain = nd.info.antenna_gain_dbi;
-        float freq_mhz = nd.info.frequency_mhz;
-        if (freq_mhz <= 0) freq_mhz = 906.875f;
-        float cable_loss = nd.info.cable_loss_db;
-        float rx_sens = nd.info.rx_sensitivity_dbm;
-        if (rx_sens >= 0) rx_sens = m_rf_config.rx_sensitivity_dbm;
-
-        /* Max range: full grid diagonal — let signal attenuation handle clipping */
-        float eirp = tx_power_dbm + antenna_gain - cable_loss;
-        int max_range_cells = static_cast<int>(
-            std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols)));
-
-        float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
 
         /* --- Viewshed pass --- */
         active_shader->use();
-        active_shader->set_ivec2("uGridSize", m_cols, m_rows);
-        active_shader->set_ivec2("uNodeCell", nc, nr);
-        active_shader->set_float("uObserverHeight", obs_h);
-        active_shader->set_int("uMaxRangeCells", max_range_cells);
-        active_shader->set_float("uTxPowerDbm", tx_power_dbm);
-        active_shader->set_float("uAntennaGainDbi", antenna_gain);
-        active_shader->set_float("uFreqMhz", freq_mhz);
-        active_shader->set_float("uCellMeters", m_cell_meters);
-        active_shader->set_float("uCableLossDb", cable_loss);
-        active_shader->set_float("uRxSensitivityDbm", rx_sens);
-        active_shader->set_float("uEarthCurveFactor", earth_curve_factor);
-        active_shader->set_float("uRxAntennaGainDbi", m_rf_config.rx_antenna_gain_dbi);
-        active_shader->set_float("uRxCableLossDb", m_rf_config.rx_cable_loss_db);
+        set_environment_uniforms(active_shader);
+        set_node_uniforms(active_shader, nd, nc, nr, node_elev + antenna_h);
 
-        if (m_prop_model == MESH3D_PROP_ITM && m_has_itm) {
-            active_shader->set_int("uClimate", m_itm_params.climate);
-            active_shader->set_float("uGroundDielectric", m_itm_params.ground_dielectric);
-            active_shader->set_float("uGroundConductivity", m_itm_params.ground_conductivity);
-            active_shader->set_int("uPolarization", m_itm_params.polarization);
-            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
-        }
-
-        if (m_prop_model == MESH3D_PROP_FRESNEL && m_has_fresnel) {
-            active_shader->set_float("uTargetHeight", m_rf_config.rx_height_agl_m);
-        }
-
-        /* Bind viewshed image textures (must be per-iteration — merge pass rebinds units 0-2) */
         glBindImageTexture(0, m_elevation_tex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
         glBindImageTexture(1, m_node_vis_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
         glBindImageTexture(2, m_node_sig_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
@@ -392,18 +363,8 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
         active_shader->dispatch(groups_x, groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-        /* --- Merge pass --- */
-        m_merge_shader.use();
-        m_merge_shader.set_ivec2("uGridSize", m_cols, m_rows);
-
-        glBindImageTexture(0, m_node_vis_tex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_R8UI);
-        glBindImageTexture(1, m_node_sig_tex,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
-        glBindImageTexture(2, m_merged_vis_tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-        glBindImageTexture(3, m_merged_sig_tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-        glBindImageTexture(4, m_overlap_tex,    0, GL_FALSE, 0, GL_READ_WRITE, GL_R8UI);
-
-        m_merge_shader.dispatch(groups_x, groups_y, 1);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        /* --- Merge: OR visibility, MAX signal, increment overlap --- */
+        dispatch_merge(groups_x, groups_y);
     }
 
     /* Place fence after all dispatches — no GPU sync until poll_state() */

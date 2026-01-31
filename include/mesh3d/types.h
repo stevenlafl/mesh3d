@@ -46,8 +46,11 @@ typedef struct {
     float ground_dielectric;    /* relative permittivity */
     float ground_conductivity;  /* S/m */
     int   polarization;         /* 0=horizontal, 1=vertical */
-    float situation_pct;        /* reliability % (50-99) */
-    float time_pct;             /* time % (50-99) */
+    float situation_pct;        /* situation % (1-99), default 50 */
+    float time_pct;             /* time % (1-99), default 50 */
+    float refractivity;         /* N_0, N-Units, default 301 */
+    float location_pct;         /* location % (1-99), default 50 */
+    int   mdvar;                /* mode of variability (0-13), default 12 */
 } mesh3d_itm_params_t;
 
 typedef struct {

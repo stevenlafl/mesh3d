@@ -1,13 +1,20 @@
 #version 430 core
 layout(local_size_x = 16, local_size_y = 16) in;
 
+// ============================================================================
+// NTIA ITM (Longley-Rice) Irregular Terrain Model — GLSL 4.3 compute shader
+//
+// Faithful port of the NTIA/ITS reference C++ implementation.
+// Each invocation computes propagation loss for one TX→RX pixel pair.
+// ============================================================================
+
 layout(binding = 0, r32f)  uniform readonly  image2D  uElevation;
 layout(binding = 1, r8ui)  uniform writeonly uimage2D uVisibility;
 layout(binding = 2, r32f)  uniform writeonly image2D  uSignal;
 
 uniform ivec2 uGridSize;        // (cols, rows)
-uniform ivec2 uNodeCell;        // (col, row) of the node
-uniform float uObserverHeight;  // node_elev + antenna_height
+uniform ivec2 uNodeCell;        // (col, row) of the TX node
+uniform float uObserverHeight;  // node_elev + antenna_height (MSL)
 uniform int   uMaxRangeCells;
 uniform float uTxPowerDbm;
 uniform float uAntennaGainDbi;
@@ -20,42 +27,941 @@ uniform float uRxAntennaGainDbi;
 uniform float uRxCableLossDb;
 
 /* ITM parameters */
-uniform int   uClimate;
-uniform float uGroundDielectric;
-uniform float uGroundConductivity;
-uniform int   uPolarization;
-uniform float uTargetHeight;     // default 2.0m
+uniform int   uClimate;            // 1-7
+uniform float uGroundDielectric;   // epsilon_r
+uniform float uGroundConductivity; // sigma (S/m)
+uniform int   uPolarization;       // 0=horiz, 1=vert
+uniform float uTargetHeight;       // RX height AGL (m)
+uniform float uRefractivity;       // N_0 (N-Units), default 301
+uniform float uLocationPct;        // 0 < loc < 100, default 50
+uniform float uSituationPct;       // 0 < sit < 100, default 50
+uniform float uTimePct;            // 0 < time < 100, default 50
+uniform int   uMdvar;              // mode of variability, default 12
 
-const float PI = 3.141592653589793;
-const float RE_M = 6371000.0;
-const float K_EFF = 4.0 / 3.0;
-const int MAX_PROFILE = 512;
+// ============================================================================
+// Constants
+// ============================================================================
 
-/* Horizon distance for antenna at height h */
-float horizon_dist(float h) {
-    return sqrt(2.0 * K_EFF * RE_M * max(h, 1.0));
+const float PI         = 3.141592653589793;
+const float SQRT2      = 1.41421356237;
+const float THIRD      = 1.0 / 3.0;
+const float a_0        = 6370e3;   // standard earth radius (m)
+const float a_9000     = 9000e3;   // 9000 km in meters
+const float gamma_a    = 157e-9;   // curvature of actual earth
+
+const int MAX_PROFILE  = 512;      // max terrain profile samples
+const int MAX_DELTA_H  = 245;      // max resampled points for delta_h
+
+// ============================================================================
+// Complex arithmetic helpers  (vec2 = (real, imag))
+// ============================================================================
+
+vec2 cmul(vec2 a, vec2 b) {
+    return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-/* Free-space path loss in dB */
-float fspl(float dist_m, float freq_mhz) {
-    float dist_km = dist_m / 1000.0;
-    dist_km = max(dist_km, 0.01);
-    return 20.0 * log(dist_km) / log(10.0)
-         + 20.0 * log(freq_mhz) / log(10.0)
-         + 32.44;
+vec2 cdiv(vec2 a, vec2 b) {
+    float d = b.x * b.x + b.y * b.y;
+    return vec2((a.x * b.x + a.y * b.y) / d, (a.y * b.x - a.x * b.y) / d);
 }
 
-/* Ground loss from impedance */
-float ground_loss(float freq_mhz, float dielectric, float conductivity, int pol) {
-    float omega = 2.0 * PI * freq_mhz * 1e6;
-    float epsilon0 = 8.854e-12;
-    float ratio = conductivity / (omega * epsilon0 * dielectric);
-    if (pol == 0) {
-        return 2.0 + 3.0 * log(1.0 + ratio) / log(10.0);
+vec2 csqrt(vec2 z) {
+    float r = length(z);
+    float theta = atan(z.y, z.x) * 0.5;
+    float sr = sqrt(r);
+    return vec2(sr * cos(theta), sr * sin(theta));
+}
+
+float cabs_val(vec2 z) {
+    return length(z);
+}
+
+// Complex exponential: exp(a+bi) = exp(a) * (cos(b) + i*sin(b))
+vec2 cexp(vec2 z) {
+    float ea = exp(z.x);
+    return vec2(ea * cos(z.y), ea * sin(z.y));
+}
+
+// Complex * real scalar
+vec2 cscale(vec2 z, float s) {
+    return z * s;
+}
+
+// ============================================================================
+// ITM Leaf Functions
+// ============================================================================
+
+// Fresnel integral approximation  [TN101v2, Eqn III.24b/c]
+// Input: v2 = v^2
+float FresnelIntegral(float v2) {
+    if (v2 < 5.76)
+        return 6.02 + 9.11 * sqrt(v2) - 1.27 * v2;
+    else
+        return 12.953 + 10.0 * log2(v2) / log2(10.0);
+}
+
+// Terrain roughness  [ERL 79-ITS 67, Eqn 3]
+float TerrainRoughness(float d_m, float delta_h) {
+    return delta_h * (1.0 - 0.8 * exp(-d_m / 50e3));
+}
+
+// Sigma-H function  [ERL 79-ITS 67, Eqn 3.6a]
+float SigmaHFunction(float delta_h) {
+    return 0.78 * delta_h * exp(-0.5 * pow(delta_h, 0.25));
+}
+
+// Free-space basic transmission loss
+float FreeSpaceLoss_ITM(float d_m, float f_mhz) {
+    return 32.45 + 20.0 * log(f_mhz) / log(10.0) + 20.0 * log(d_m / 1000.0) / log(10.0);
+}
+
+// Height function F(x,K) for smooth earth diffraction  [Vogler 1964]
+float HeightFunction(float x_km, float K) {
+    float w, result;
+
+    if (x_km < 200.0) {
+        w = -log(K);
+        if (K < 1e-5 || x_km * w * w * w > 5495.0) {
+            result = -117.0;
+            if (x_km > 1.0)
+                result = 17.372 * log(x_km) + result;
+        } else {
+            result = 2.5e-5 * x_km * x_km / K - 8.686 * w - 15.0;
+        }
     } else {
-        return 1.0 + 2.0 * log(1.0 + ratio) / log(10.0);
+        result = 0.05751 * x_km - 4.343 * log(x_km);
+        if (x_km < 2000.0) {
+            w = 0.0134 * x_km * exp(-0.005 * x_km);
+            result = (1.0 - w) * result + w * (17.372 * log(x_km) - 117.0);
+        }
+    }
+    return result;
+}
+
+// H0 curve fit  [Algorithm, 6.13]
+float H0Curve(int j, float r) {
+    const float a_h0[5] = float[5](25.0, 80.0, 177.0, 395.0, 705.0);
+    const float b_h0[5] = float[5](24.0, 45.0, 68.0, 80.0, 105.0);
+    float inv_r2 = 1.0 / (r * r);
+    float inv_r4 = inv_r2 * inv_r2;
+    return 10.0 * log(1.0 + a_h0[j] * inv_r4 + b_h0[j] * inv_r2) / log(10.0);
+}
+
+// H0 function  [TN101v1, Ch 9.2]
+float H0Function(float r, float eta_s_in) {
+    float eta_s = clamp(eta_s_in, 1.0, 5.0);
+    int i = int(eta_s);
+    float q = eta_s - float(i);
+    float result = H0Curve(i - 1, r);
+    if (q > 0.0)
+        result = (1.0 - q) * result + q * H0Curve(min(i, 4), r);
+    return result;
+}
+
+// Attenuation function F(th*d)  [Algorithm, 6.9]
+float FFunction(float td) {
+    const float a_f[3] = float[3](133.4, 104.6, 71.8);
+    const float b_f[3] = float[3](0.332e-3, 0.212e-3, 0.157e-3);
+    const float c_f[3] = float[3](-10.0, -2.5, 5.0);
+    int i;
+    if (td <= 10e3)      i = 0;
+    else if (td <= 70e3) i = 1;
+    else                 i = 2;
+    return a_f[i] + b_f[i] * td + c_f[i] * log(td) / log(10.0);
+}
+
+// Inverse complementary CDF  [Abramowitz & Stegun, Formula 26.2.23]
+float InverseComplementaryCDF(float q_in) {
+    const float C_0 = 2.515516;
+    const float C_1 = 0.802853;
+    const float C_2 = 0.010328;
+    const float D_1 = 1.432788;
+    const float D_2 = 0.189269;
+    const float D_3 = 0.001308;
+
+    float x = q_in;
+    if (q_in > 0.5) x = 1.0 - x;
+    float T_x = sqrt(-2.0 * log(x));
+    float zeta_x = ((C_2 * T_x + C_1) * T_x + C_0) / (((D_3 * T_x + D_2) * T_x + D_1) * T_x + 1.0);
+    float Q_q = T_x - zeta_x;
+    if (q_in > 0.5) Q_q = -Q_q;
+    return Q_q;
+}
+
+// ============================================================================
+// InitializePointToPoint
+// Outputs: Z_g (complex ground impedance), gamma_e, N_s
+// ============================================================================
+
+void InitializePointToPoint(float f_mhz, float h_sys, float N_0, int pol,
+    float epsilon, float sigma,
+    out vec2 Z_g, out float gamma_e_out, out float N_s_out)
+{
+    // Scale refractivity by elevation
+    float N_s;
+    if (h_sys == 0.0)
+        N_s = N_0;
+    else
+        N_s = N_0 * exp(-h_sys / 9460.0);
+
+    // Effective earth curvature
+    float ge = gamma_a * (1.0 - 0.04665 * exp(N_s / 179.3));
+
+    // Complex relative permittivity: ep_r = (epsilon, 18000 * sigma / f_mhz)
+    vec2 ep_r = vec2(epsilon, 18000.0 * sigma / f_mhz);
+
+    // Ground impedance = sqrt(ep_r - 1)  (horizontal polarization)
+    Z_g = csqrt(ep_r - vec2(1.0, 0.0));
+
+    // Vertical polarization adjustment: Z_g = Z_g / ep_r
+    if (pol == 1)
+        Z_g = cdiv(Z_g, ep_r);
+
+    gamma_e_out = ge;
+    N_s_out = N_s;
+}
+
+// ============================================================================
+// FindHorizons — scan terrain profile for radio horizons
+// pfl[0]=np, pfl[1]=xi, pfl[2..np+2]=elevations
+// ============================================================================
+
+void FindHorizons(float pfl[MAX_PROFILE + 2], float a_e, float h_tx, float h_rx,
+    out float theta_hzn_0, out float theta_hzn_1,
+    out float d_hzn_0, out float d_hzn_1)
+{
+    int np = int(pfl[0]);
+    float xi = pfl[1];
+    float d_total = pfl[0] * pfl[1];
+
+    float z_tx = pfl[2] + h_tx;
+    float z_rx = pfl[np + 2] + h_rx;
+
+    // Initialize as LOS
+    theta_hzn_0 = (z_rx - z_tx) / d_total - d_total / (2.0 * a_e);
+    theta_hzn_1 = -(z_rx - z_tx) / d_total - d_total / (2.0 * a_e);
+    d_hzn_0 = d_total;
+    d_hzn_1 = d_total;
+
+    float d_tx = 0.0;
+    float d_rx = d_total;
+
+    for (int i = 1; i < np; i++) {
+        d_tx += xi;
+        d_rx -= xi;
+
+        float theta_tx = (pfl[i + 2] - z_tx) / d_tx - d_tx / (2.0 * a_e);
+        float theta_rx = -(z_rx - pfl[i + 2]) / d_rx - d_rx / (2.0 * a_e);
+
+        if (theta_tx > theta_hzn_0) {
+            theta_hzn_0 = theta_tx;
+            d_hzn_0 = d_tx;
+        }
+        if (theta_rx > theta_hzn_1) {
+            theta_hzn_1 = theta_rx;
+            d_hzn_1 = d_rx;
+        }
     }
 }
+
+// ============================================================================
+// LinearLeastSquaresFit
+// ============================================================================
+
+void LinearLeastSquaresFit(float pfl[MAX_PROFILE + 2], float d_start, float d_end,
+    out float fit_y1, out float fit_y2)
+{
+    int np = int(pfl[0]);
+    float xi = pfl[1];
+
+    int i_start = int(max(d_start / xi, 0.0));
+    int i_end = np - int(max(float(np) - d_end / xi, 0.0));
+
+    if (i_end <= i_start) {
+        i_start = int(max(float(i_start) - 1.0, 0.0));
+        i_end = np - int(max(float(np) - float(i_end) - 1.0, 0.0));
+    }
+
+    float x_length = float(i_end - i_start);
+    if (x_length < 1.0) {
+        fit_y1 = pfl[i_start + 2];
+        fit_y2 = pfl[i_end + 2];
+        return;
+    }
+
+    float mid_shifted_index = -0.5 * x_length;
+    float mid_shifted_end = float(i_end) + mid_shifted_index;
+
+    float sum_y = 0.5 * (pfl[i_start + 2] + pfl[i_end + 2]);
+    float scaled_sum_y = 0.5 * (pfl[i_start + 2] - pfl[i_end + 2]) * mid_shifted_index;
+
+    int is = i_start;
+    float msi = mid_shifted_index;
+    for (int i = 2; i <= int(x_length); i++) {
+        is++;
+        msi += 1.0;
+        sum_y += pfl[is + 2];
+        scaled_sum_y += pfl[is + 2] * msi;
+    }
+
+    sum_y = sum_y / x_length;
+    scaled_sum_y = scaled_sum_y * 12.0 / ((x_length * x_length + 2.0) * x_length);
+
+    fit_y1 = sum_y - scaled_sum_y * mid_shifted_end;
+    fit_y2 = sum_y + scaled_sum_y * (float(np) - mid_shifted_end);
+}
+
+// ============================================================================
+// ComputeDeltaH — terrain irregularity (10th-90th percentile of residuals)
+// Uses insertion sort for partial ordering on GPU
+// ============================================================================
+
+float ComputeDeltaH(float pfl[MAX_PROFILE + 2], float d_start, float d_end) {
+    int np = int(pfl[0]);
+    float xi = pfl[1];
+    float x_start_f = d_start / xi;
+    float x_end_f = d_end / xi;
+
+    if (x_end_f - x_start_f < 2.0)
+        return 0.0;
+
+    int p10 = int(0.1 * (x_end_f - x_start_f + 8.0));
+    p10 = clamp(p10, 4, 25);
+
+    int n = 10 * p10 - 5;
+    int p90 = n - p10;
+
+    // Limit n to MAX_DELTA_H
+    if (n > MAX_DELTA_H) n = MAX_DELTA_H;
+    if (p90 >= n) p90 = n - 1;
+
+    float np_s = float(n - 1);
+
+    // Build resampled profile in temporary array
+    // We reuse a sub-array approach: store resampled in s[0..n-1]
+    float s_pfl0 = np_s;
+    float s_pfl1 = 1.0;
+
+    float x_end_step = (x_end_f - x_start_f) / np_s;
+    int ii = int(x_start_f);
+    float xs = x_start_f - float(ii + 1);
+
+    // Store resampled elevations
+    float s_elev[MAX_DELTA_H];
+    for (int j = 0; j < n; j++) {
+        while (xs > 0.0 && (ii + 1) < np) {
+            xs -= 1.0;
+            ii++;
+        }
+        s_elev[j] = pfl[ii + 3] + (pfl[ii + 3] - pfl[ii + 2]) * xs;
+        xs += x_end_step;
+    }
+
+    // Linear least squares fit on resampled data
+    // Inline simplified version for the resampled data
+    float x_len = np_s;
+    float msi_init = -0.5 * x_len;
+    float mse = float(n - 1) + msi_init;
+
+    float sy = 0.5 * (s_elev[0] + s_elev[n - 1]);
+    float ssy = 0.5 * (s_elev[0] - s_elev[n - 1]) * msi_init;
+
+    float msi_cur = msi_init;
+    for (int i = 1; i < n - 1; i++) {
+        msi_cur += 1.0;
+        sy += s_elev[i];
+        ssy += s_elev[i] * msi_cur;
+    }
+
+    sy = sy / x_len;
+    ssy = ssy * 12.0 / ((x_len * x_len + 2.0) * x_len);
+
+    float fy1 = sy - ssy * mse;
+    float slope = (sy + ssy * (np_s - mse) - fy1) / np_s;
+
+    // Compute residuals (differences from fitted line)
+    float diffs[MAX_DELTA_H];
+    float fit_val = fy1;
+    for (int j = 0; j < n; j++) {
+        diffs[j] = s_elev[j] - fit_val;
+        fit_val += slope;
+    }
+
+    // Insertion sort (descending) to find percentiles
+    for (int i = 1; i < n; i++) {
+        float key = diffs[i];
+        int j = i - 1;
+        while (j >= 0 && diffs[j] < key) {
+            diffs[j + 1] = diffs[j];
+            j--;
+        }
+        diffs[j + 1] = key;
+    }
+
+    // 10th percentile (from top) and 90th percentile
+    float q10 = diffs[p10 - 1];
+    float q90 = diffs[p90];
+
+    float delta_h_d = q10 - q90;
+
+    // Invert the TerrainRoughness scaling
+    float range = d_end - d_start;
+    float factor = 1.0 - 0.8 * exp(-range / 50e3);
+    if (factor < 0.01) factor = 0.01;
+    return delta_h_d / factor;
+}
+
+// ============================================================================
+// QuickPfl — extract terrain geometry parameters
+// ============================================================================
+
+void QuickPfl(float pfl[MAX_PROFILE + 2], float gamma_e, float h_tx, float h_rx,
+    out float theta_hzn_0, out float theta_hzn_1,
+    out float d_hzn_0, out float d_hzn_1,
+    out float h_e_0, out float h_e_1,
+    out float delta_h_out, out float d_out)
+{
+    int np = int(pfl[0]);
+    float xi = pfl[1];
+    d_out = pfl[0] * pfl[1];
+
+    float a_e = 1.0 / gamma_e;
+
+    FindHorizons(pfl, a_e, h_tx, h_rx, theta_hzn_0, theta_hzn_1, d_hzn_0, d_hzn_1);
+
+    float d_start = min(15.0 * h_tx, 0.1 * d_hzn_0);
+    float d_end = d_out - min(15.0 * h_rx, 0.1 * d_hzn_1);
+
+    delta_h_out = ComputeDeltaH(pfl, d_start, d_end);
+
+    if (d_hzn_0 + d_hzn_1 > 1.5 * d_out) {
+        // Well within LOS
+        float fit_tx, fit_rx;
+        LinearLeastSquaresFit(pfl, d_start, d_end, fit_tx, fit_rx);
+
+        h_e_0 = h_tx + max(pfl[2] - fit_tx, 0.0);
+        h_e_1 = h_rx + max(pfl[np + 2] - fit_rx, 0.0);
+
+        for (int i = 0; i < 2; i++) {
+            float he = (i == 0) ? h_e_0 : h_e_1;
+            float dh_i = sqrt(2.0 * he * a_e) * exp(-0.07 * sqrt(delta_h_out / max(he, 5.0)));
+            if (i == 0) d_hzn_0 = dh_i; else d_hzn_1 = dh_i;
+        }
+
+        float combined = d_hzn_0 + d_hzn_1;
+        if (combined <= d_out) {
+            float q = (d_out / combined) * (d_out / combined);
+            h_e_0 *= q;
+            h_e_1 *= q;
+            for (int i = 0; i < 2; i++) {
+                float he = (i == 0) ? h_e_0 : h_e_1;
+                float dh_i = sqrt(2.0 * he * a_e) * exp(-0.07 * sqrt(delta_h_out / max(he, 5.0)));
+                if (i == 0) d_hzn_0 = dh_i; else d_hzn_1 = dh_i;
+            }
+        }
+
+        for (int i = 0; i < 2; i++) {
+            float he = (i == 0) ? h_e_0 : h_e_1;
+            float dh_i = (i == 0) ? d_hzn_0 : d_hzn_1;
+            float q = sqrt(2.0 * he * a_e);
+            float th = (0.65 * delta_h_out * (q / dh_i - 1.0) - 2.0 * he) / q;
+            if (i == 0) theta_hzn_0 = th; else theta_hzn_1 = th;
+        }
+    } else {
+        // Trans-horizon
+        float fit_tx, fit_rx, dummy;
+
+        LinearLeastSquaresFit(pfl, d_start, 0.9 * d_hzn_0, fit_tx, dummy);
+        h_e_0 = h_tx + max(pfl[2] - fit_tx, 0.0);
+
+        LinearLeastSquaresFit(pfl, d_out - 0.9 * d_hzn_1, d_end, dummy, fit_rx);
+        h_e_1 = h_rx + max(pfl[np + 2] - fit_rx, 0.0);
+    }
+}
+
+// ============================================================================
+// KnifeEdgeDiffraction
+// ============================================================================
+
+float KnifeEdgeDiffraction(float d_m, float f_mhz, float a_e, float theta_los,
+    float d_hzn_0, float d_hzn_1)
+{
+    float d_ML = d_hzn_0 + d_hzn_1;
+    float theta_nlos = d_m / a_e - theta_los;
+    float d_nlos = d_m - d_ML;
+
+    float wn = f_mhz / 47.7;
+    float v_1 = 0.0795775 * wn * theta_nlos * theta_nlos * d_hzn_0 * d_nlos / (d_nlos + d_hzn_0);
+    float v_2 = 0.0795775 * wn * theta_nlos * theta_nlos * d_hzn_1 * d_nlos / (d_nlos + d_hzn_1);
+
+    return FresnelIntegral(v_1) + FresnelIntegral(v_2);
+}
+
+// ============================================================================
+// SmoothEarthDiffraction — Vogler 3-radii method
+// ============================================================================
+
+float SmoothEarthDiffraction(float d_m, float f_mhz, float a_e, float theta_los,
+    float d_hzn_0, float d_hzn_1,
+    float h_e_0, float h_e_1, vec2 Z_g)
+{
+    float theta_nlos = d_m / a_e - theta_los;
+    float d_ML = d_hzn_0 + d_hzn_1;
+
+    // Three radii
+    float a_0_r = (d_m - d_ML) / (d_m / a_e - theta_los);
+    float a_1_r = 0.5 * d_hzn_0 * d_hzn_0 / h_e_0;
+    float a_2_r = 0.5 * d_hzn_1 * d_hzn_1 / h_e_1;
+
+    float d_km_0 = (a_0_r * theta_nlos) / 1000.0;
+    float d_km_1 = d_hzn_0 / 1000.0;
+    float d_km_2 = d_hzn_1 / 1000.0;
+
+    float abs_Z_g = cabs_val(Z_g);
+
+    float C0_0 = pow(1.333333 * a_0 / a_0_r, THIRD);
+    float C0_1 = pow(1.333333 * a_0 / a_1_r, THIRD);
+    float C0_2 = pow(1.333333 * a_0 / a_2_r, THIRD);
+
+    float f_third = pow(f_mhz, THIRD);
+    float f_neg_third = pow(f_mhz, -THIRD);
+
+    float K_0 = 0.017778 * C0_0 * f_neg_third / abs_Z_g;
+    float K_1 = 0.017778 * C0_1 * f_neg_third / abs_Z_g;
+    float K_2 = 0.017778 * C0_2 * f_neg_third / abs_Z_g;
+
+    float B0_0 = 1.607 - K_0;
+    float B0_1 = 1.607 - K_1;
+    float B0_2 = 1.607 - K_2;
+
+    float x_km_1 = B0_1 * C0_1 * C0_1 * f_third * d_km_1;
+    float x_km_2 = B0_2 * C0_2 * C0_2 * f_third * d_km_2;
+    float x_km_0 = B0_0 * C0_0 * C0_0 * f_third * d_km_0 + x_km_1 + x_km_2;
+
+    float F_x_0 = HeightFunction(x_km_1, K_1);
+    float F_x_1 = HeightFunction(x_km_2, K_2);
+
+    float G_x = 0.05751 * x_km_0 - 10.0 * log(x_km_0) / log(10.0);
+
+    return G_x - F_x_0 - F_x_1 - 20.0;
+}
+
+// ============================================================================
+// DiffractionLoss — combined knife-edge + smooth-earth + clutter
+// ============================================================================
+
+float DiffractionLoss(float d_m, float d_hzn_0, float d_hzn_1,
+    float h_e_0, float h_e_1, vec2 Z_g, float a_e,
+    float delta_h, float h_tx, float h_rx,
+    float theta_los, float d_sML, float f_mhz)
+{
+    float A_k = KnifeEdgeDiffraction(d_m, f_mhz, a_e, theta_los, d_hzn_0, d_hzn_1);
+    float A_se = SmoothEarthDiffraction(d_m, f_mhz, a_e, theta_los, d_hzn_0, d_hzn_1, h_e_0, h_e_1, Z_g);
+
+    // Terrain clutter
+    float delta_h_dsML = TerrainRoughness(d_sML, delta_h);
+    float sigma_h_d = SigmaHFunction(delta_h_dsML);
+    float A_fo = min(15.0, 5.0 * log(1.0 + 1e-5 * h_tx * h_rx * f_mhz * sigma_h_d) / log(10.0));
+
+    // Weighting factor
+    float delta_h_d = TerrainRoughness(d_m, delta_h);
+    float q = h_tx * h_rx;
+    float qk = h_e_0 * h_e_1 - q;
+
+    // P2P mode: C ~= 10
+    q += 10.0;
+
+    float term1 = sqrt(1.0 + qk / q);
+    float d_ML = d_hzn_0 + d_hzn_1;
+    q = (term1 + (-theta_los * a_e + d_ML) / d_m) * min(delta_h_d * f_mhz / 47.7, 6283.2);
+
+    float w = 25.1 / (25.1 + sqrt(q));
+
+    return w * A_se + (1.0 - w) * A_k + A_fo;
+}
+
+// ============================================================================
+// LineOfSightLoss — two-ray + complex ground reflection
+// ============================================================================
+
+float LineOfSightLoss(float d_m, float h_e_0, float h_e_1, vec2 Z_g,
+    float delta_h, float M_d, float A_d0, float d_sML, float f_mhz)
+{
+    float delta_h_d = TerrainRoughness(d_m, delta_h);
+    float sigma_h_d = SigmaHFunction(delta_h_d);
+
+    float wn = f_mhz / 47.7;
+
+    // Elevation angle
+    float sum_h = h_e_0 + h_e_1;
+    float sin_psi = sum_h / sqrt(d_m * d_m + sum_h * sum_h);
+
+    // Ground reflection coefficient (complex)
+    // R_e = (sin_psi - Z_g) / (sin_psi + Z_g) * exp(-min(10, wn * sigma_h_d * sin_psi))
+    vec2 num = vec2(sin_psi, 0.0) - Z_g;
+    vec2 den = vec2(sin_psi, 0.0) + Z_g;
+    vec2 R_e = cmul(cdiv(num, den), vec2(exp(-min(10.0, wn * sigma_h_d * sin_psi)), 0.0));
+
+    // Magnitude adjustment
+    float q = R_e.x * R_e.x + R_e.y * R_e.y;
+    if (q < 0.25 || q < sin_psi)
+        R_e = R_e * sqrt(sin_psi / q);
+
+    // Phase difference
+    float delta_phi = wn * 2.0 * h_e_0 * h_e_1 / d_m;
+    if (delta_phi > PI / 2.0)
+        delta_phi = PI - (PI / 2.0) * (PI / 2.0) / delta_phi;
+
+    // Two-ray attenuation (complex)
+    vec2 rr = vec2(cos(delta_phi), -sin(delta_phi)) + R_e;
+    float A_t = -10.0 * log(rr.x * rr.x + rr.y * rr.y) / log(10.0);
+
+    // Extended diffraction
+    float A_d = M_d * d_m + A_d0;
+
+    // Weighting factor
+    float w = 1.0 / (1.0 + f_mhz * delta_h / max(10e3, d_sML));
+
+    return w * A_t + (1.0 - w) * A_d;
+}
+
+// ============================================================================
+// TroposcatterLoss
+// ============================================================================
+
+float TroposcatterLoss(float d_m, float theta_hzn_0, float theta_hzn_1,
+    float d_hzn_0, float d_hzn_1, float h_e_0, float h_e_1,
+    float a_e, float N_s, float f_mhz, float theta_los,
+    inout float h0)
+{
+    float H_0;
+    float wn = f_mhz / 47.7;
+
+    if (h0 > 15.0) {
+        H_0 = h0;
+    } else {
+        float ad = d_hzn_0 - d_hzn_1;
+        float rr = h_e_1 / h_e_0;
+
+        if (ad < 0.0) {
+            ad = -ad;
+            rr = 1.0 / rr;
+        }
+
+        float theta = theta_hzn_0 + theta_hzn_1 + d_m / a_e;
+
+        float r_1 = 2.0 * wn * theta * h_e_0;
+        float r_2 = 2.0 * wn * theta * h_e_1;
+
+        if (r_1 < 0.2 && r_2 < 0.2)
+            return 1001.0;  // undefined
+
+        float s = (d_m - ad) / (d_m + ad);
+        float q = clamp(rr / s, 0.1, 10.0);
+        s = max(0.1, s);
+
+        float h_0_m = (d_m - ad) * (d_m + ad) * theta * 0.25 / d_m;
+
+        float eta_s = (h_0_m / 1.7556e3) * (1.0 + (0.031 - N_s * 2.32e-3 + N_s * N_s * 5.67e-6) *
+            exp(-pow(min(1.7, h_0_m / 8.0e3), 6.0)));
+
+        float H_00 = (H0Function(r_1, eta_s) + H0Function(r_2, eta_s)) * 0.5;
+        float Delta_H_0 = min(H_00, 6.0 * (0.6 - log(max(eta_s, 1.0)) / log(10.0)) *
+            (log(s) / log(10.0)) * (log(q) / log(10.0)));
+
+        H_0 = H_00 + Delta_H_0;
+        H_0 = max(H_0, 0.0);
+
+        if (eta_s < 1.0) {
+            float t1 = (1.0 + SQRT2 / r_1) * (1.0 + SQRT2 / r_2);
+            float t2 = t1 * t1 * (r_1 + r_2) / (r_1 + r_2 + 2.0 * SQRT2);
+            H_0 = eta_s * H_0 + (1.0 - eta_s) * 10.0 * log(t2) / log(10.0);
+        }
+
+        if (H_0 > 15.0 && h0 >= 0.0)
+            H_0 = h0;
+    }
+
+    h0 = H_0;
+    float th = d_m / a_e - theta_los;
+
+    return FFunction(th * d_m) + 10.0 * log(wn * 47.7 * th * th * th * th) / log(10.0) -
+        0.1 * (N_s - 301.0) * exp(-th * d_m / 40e3) + H_0;
+}
+
+// ============================================================================
+// LongleyRice — compute reference attenuation A_ref
+// Returns A_ref in dB. propmode: 1=LOS, 2=diffraction, 3=troposcatter
+// ============================================================================
+
+float LongleyRice(float theta_hzn_0, float theta_hzn_1, float f_mhz, vec2 Z_g,
+    float d_hzn_0, float d_hzn_1, float h_e_0, float h_e_1,
+    float gamma_e, float N_s, float delta_h, float h_tx, float h_rx,
+    float d_m, out int propmode)
+{
+    float a_e = 1.0 / gamma_e;
+
+    // Smooth earth horizon distances
+    float d_hzn_s_0 = sqrt(2.0 * h_e_0 * a_e);
+    float d_hzn_s_1 = sqrt(2.0 * h_e_1 * a_e);
+    float d_sML = d_hzn_s_0 + d_hzn_s_1;
+    float d_ML = d_hzn_0 + d_hzn_1;
+
+    // Angular distance of LOS region
+    float theta_los = -max(theta_hzn_0 + theta_hzn_1, -d_ML / a_e);
+
+    // Two reference distances far in diffraction region
+    float ae2_over_f = a_e * a_e / f_mhz;
+    float d_3 = max(d_sML, d_ML + 5.0 * pow(ae2_over_f, THIRD));
+    float d_4 = d_3 + 10.0 * pow(ae2_over_f, THIRD);
+
+    // Diffraction loss at two distances
+    float A_3 = DiffractionLoss(d_3, d_hzn_0, d_hzn_1, h_e_0, h_e_1, Z_g, a_e, delta_h, h_tx, h_rx, theta_los, d_sML, f_mhz);
+    float A_4 = DiffractionLoss(d_4, d_hzn_0, d_hzn_1, h_e_0, h_e_1, Z_g, a_e, delta_h, h_tx, h_rx, theta_los, d_sML, f_mhz);
+
+    // Diffraction line slope and intercept
+    float M_d = (A_4 - A_3) / (d_4 - d_3);
+    float A_d0 = A_3 - M_d * d_3;
+
+    float A_ref;
+
+    if (d_m < d_sML) {
+        // LOS region
+        float A_sML = d_sML * M_d + A_d0;
+
+        float d_0 = 0.04 * f_mhz * h_e_0 * h_e_1;
+
+        float d_1;
+        if (A_d0 >= 0.0) {
+            d_0 = min(d_0, 0.5 * d_ML);
+            d_1 = d_0 + 0.25 * (d_ML - d_0);
+        } else {
+            d_1 = max(-A_d0 / M_d, 0.25 * d_ML);
+        }
+
+        float A_1 = LineOfSightLoss(d_1, h_e_0, h_e_1, Z_g, delta_h, M_d, A_d0, d_sML, f_mhz);
+
+        bool flag = false;
+        float kHat_1 = 0.0;
+        float kHat_2 = 0.0;
+
+        if (d_0 < d_1) {
+            float A_0 = LineOfSightLoss(d_0, h_e_0, h_e_1, Z_g, delta_h, M_d, A_d0, d_sML, f_mhz);
+            float q = log(d_sML / d_0);
+
+            kHat_2 = max(0.0, ((d_sML - d_0) * (A_1 - A_0) - (d_1 - d_0) * (A_sML - A_0)) /
+                ((d_sML - d_0) * log(d_1 / d_0) - (d_1 - d_0) * q));
+
+            flag = A_d0 > 0.0 || kHat_2 > 0.0;
+
+            if (flag) {
+                kHat_1 = (A_sML - A_0 - kHat_2 * q) / (d_sML - d_0);
+                if (kHat_1 < 0.0) {
+                    kHat_1 = 0.0;
+                    kHat_2 = max(A_sML - A_0, 0.0) / q;
+                    if (kHat_2 == 0.0)
+                        kHat_1 = M_d;
+                }
+            }
+        }
+
+        if (!flag) {
+            kHat_1 = max(A_sML - A_1, 0.0) / (d_sML - d_1);
+            kHat_2 = 0.0;
+            if (kHat_1 == 0.0)
+                kHat_1 = M_d;
+        }
+
+        float A_o = A_sML - kHat_1 * d_sML - kHat_2 * log(d_sML);
+        A_ref = A_o + kHat_1 * d_m + kHat_2 * log(d_m);
+        propmode = 1;  // LOS
+    } else {
+        // Trans-horizon: troposcatter + diffraction
+        float d_5 = d_ML + 200e3;
+        float d_6 = d_ML + 400e3;
+
+        float h0_val = -1.0;
+        float A_6 = TroposcatterLoss(d_6, theta_hzn_0, theta_hzn_1, d_hzn_0, d_hzn_1,
+            h_e_0, h_e_1, a_e, N_s, f_mhz, theta_los, h0_val);
+        float A_5 = TroposcatterLoss(d_5, theta_hzn_0, theta_hzn_1, d_hzn_0, d_hzn_1,
+            h_e_0, h_e_1, a_e, N_s, f_mhz, theta_los, h0_val);
+
+        float M_s, A_s0, d_x;
+
+        if (A_5 < 1000.0) {
+            M_s = (A_6 - A_5) / 200e3;
+            d_x = max(max(d_sML, d_ML + 1.088 * pow(ae2_over_f, THIRD) * log(f_mhz)),
+                (A_5 - A_d0 - M_s * d_5) / (M_d - M_s));
+            A_s0 = (M_d - M_s) * d_x + A_d0;
+        } else {
+            M_s = M_d;
+            A_s0 = A_d0;
+            d_x = 10e6;
+        }
+
+        if (d_m > d_x) {
+            A_ref = M_s * d_m + A_s0;
+            propmode = 3;  // troposcatter
+        } else {
+            A_ref = M_d * d_m + A_d0;
+            propmode = 2;  // diffraction
+        }
+    }
+
+    return max(A_ref, 0.0);
+}
+
+// ============================================================================
+// Variability — statistical adjustments
+// ============================================================================
+
+// Curve helper function  [TN101v2, Eqn III.69 & III.70]
+float CurveVar(float c1, float c2, float x1, float x2, float x3, float d_e) {
+    float t1 = d_e / x1;
+    float t2 = (d_e - x2) / x3;
+    return (c1 + c2 / (1.0 + t2 * t2)) * (t1 * t1) / (1.0 + t1 * t1);
+}
+
+float Variability(float time_pct, float location_pct, float situation_pct,
+    float h_e_0, float h_e_1, float delta_h, float f_mhz,
+    float d_m, float A_ref, int climate, int mdvar_in)
+{
+    // Climate tables (0-indexed, 7 climates)
+    const float all_year_0[7] = float[7](-9.67, -0.62, 1.26, -9.21, -0.62, -0.39, 3.15);
+    const float all_year_1[7] = float[7](12.7, 9.19, 15.5, 9.05, 9.19, 2.86, 857.9);
+    const float all_year_2[7] = float[7](144.9e3, 228.9e3, 262.6e3, 84.1e3, 228.9e3, 141.7e3, 2222.0e3);
+    const float all_year_3[7] = float[7](190.3e3, 205.2e3, 185.2e3, 101.1e3, 205.2e3, 315.9e3, 164.8e3);
+    const float all_year_4[7] = float[7](133.8e3, 143.6e3, 99.8e3, 98.6e3, 143.6e3, 167.4e3, 116.3e3);
+
+    const float bsm1_v[7] = float[7](2.13, 2.66, 6.11, 1.98, 2.68, 6.86, 8.51);
+    const float bsm2_v[7] = float[7](159.5, 7.67, 6.65, 13.11, 7.16, 10.38, 169.8);
+    const float xsm1_v[7] = float[7](762.2e3, 100.4e3, 138.2e3, 139.1e3, 93.7e3, 187.8e3, 609.8e3);
+    const float xsm2_v[7] = float[7](123.6e3, 172.5e3, 242.2e3, 132.7e3, 186.8e3, 169.6e3, 119.9e3);
+    const float xsm3_v[7] = float[7](94.5e3, 136.4e3, 178.6e3, 193.5e3, 133.5e3, 108.9e3, 106.6e3);
+
+    const float bsp1_v[7] = float[7](2.11, 6.87, 10.08, 3.68, 4.75, 8.58, 8.43);
+    const float bsp2_v[7] = float[7](102.3, 15.53, 9.60, 159.3, 8.12, 13.97, 8.19);
+    const float xsp1_v[7] = float[7](636.9e3, 138.7e3, 165.3e3, 464.4e3, 93.2e3, 216.0e3, 136.2e3);
+    const float xsp2_v[7] = float[7](134.8e3, 143.7e3, 225.7e3, 93.1e3, 135.9e3, 152.0e3, 188.5e3);
+    const float xsp3_v[7] = float[7](95.6e3, 98.6e3, 129.7e3, 94.2e3, 113.4e3, 122.7e3, 122.9e3);
+
+    const float C_D_v[7] = float[7](1.224, 0.801, 1.380, 1.000, 1.224, 1.518, 1.518);
+    const float z_D_v[7] = float[7](1.282, 2.161, 1.282, 20.0, 1.282, 1.282, 1.282);
+
+    const float bfm1_v[7] = float[7](1.0, 1.0, 1.0, 1.0, 0.92, 1.0, 1.0);
+    const float bfm2_v[7] = float[7](0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0);
+    const float bfm3_v[7] = float[7](0.0, 0.0, 0.0, 0.0, 1.77, 0.0, 0.0);
+
+    const float bfp1_v[7] = float[7](1.0, 0.93, 1.0, 0.93, 0.93, 1.0, 1.0);
+    const float bfp2_v[7] = float[7](0.0, 0.31, 0.0, 0.19, 0.31, 0.0, 0.0);
+    const float bfp3_v[7] = float[7](0.0, 2.00, 0.0, 1.79, 2.00, 0.0, 0.0);
+
+    float z_T = InverseComplementaryCDF(time_pct / 100.0);
+    float z_L = InverseComplementaryCDF(location_pct / 100.0);
+    float z_S = InverseComplementaryCDF(situation_pct / 100.0);
+
+    int ci = climate - 1;  // 0-indexed
+    ci = clamp(ci, 0, 6);
+
+    float wn = f_mhz / 47.7;
+
+    // Effective distance
+    float d_ex = sqrt(2.0 * a_9000 * h_e_0) + sqrt(2.0 * a_9000 * h_e_1) + pow(575.7e12 / wn, THIRD);
+
+    float d_e;
+    if (d_m < d_ex)
+        d_e = 130e3 * d_m / d_ex;
+    else
+        d_e = 130e3 + d_m - d_ex;
+
+    // Situation variability
+    int mdvar_internal = mdvar_in;
+    bool plus20 = mdvar_internal >= 20;
+    if (plus20) mdvar_internal -= 20;
+
+    float sigma_S;
+    if (plus20)
+        sigma_S = 0.0;
+    else
+        sigma_S = 5.0 + 3.0 * exp(-d_e / 100e3);
+
+    bool plus10 = mdvar_internal >= 10;
+    if (plus10) mdvar_internal -= 10;
+
+    // Median curve
+    float V_med = CurveVar(all_year_0[ci], all_year_1[ci], all_year_2[ci], all_year_3[ci], all_year_4[ci], d_e);
+
+    // Mode adjustments
+    if (mdvar_internal == 0) {       // single message
+        z_T = z_S;
+        z_L = z_S;
+    } else if (mdvar_internal == 1) { // accidental
+        z_L = z_S;
+    } else if (mdvar_internal == 2) { // mobile
+        z_L = z_T;
+    }
+    // else broadcast (3) - no change
+
+    // Location variability
+    float sigma_L;
+    if (plus10)
+        sigma_L = 0.0;
+    else {
+        float delta_h_d = TerrainRoughness(d_m, delta_h);
+        sigma_L = 10.0 * wn * delta_h_d / (wn * delta_h_d + 13.0);
+    }
+    float Y_L = sigma_L * z_L;
+
+    // Time variability
+    float q_log = log(0.133 * wn);
+    float g_minus = bfm1_v[ci] + bfm2_v[ci] / (bfm3_v[ci] * bfm3_v[ci] * q_log * q_log + 1.0);
+    float g_plus = bfp1_v[ci] + bfp2_v[ci] / (bfp3_v[ci] * bfp3_v[ci] * q_log * q_log + 1.0);
+
+    float sigma_T_minus = CurveVar(bsm1_v[ci], bsm2_v[ci], xsm1_v[ci], xsm2_v[ci], xsm3_v[ci], d_e) * g_minus;
+    float sigma_T_plus = CurveVar(bsp1_v[ci], bsp2_v[ci], xsp1_v[ci], xsp2_v[ci], xsp3_v[ci], d_e) * g_plus;
+
+    float sigma_TD = C_D_v[ci] * sigma_T_plus;
+    float tgtd = (sigma_T_plus - sigma_TD) * z_D_v[ci];
+
+    float sigma_T;
+    if (z_T < 0.0)
+        sigma_T = sigma_T_minus;
+    else if (z_T <= z_D_v[ci])
+        sigma_T = sigma_T_plus;
+    else
+        sigma_T = sigma_TD + tgtd / z_T;
+
+    float Y_T = sigma_T * z_T;
+
+    float Y_S_temp = sigma_S * sigma_S + Y_T * Y_T / (7.8 + z_S * z_S) + Y_L * Y_L / (24.0 + z_S * z_S);
+
+    float Y_R, Y_S;
+    if (mdvar_internal == 0) {       // single message
+        Y_R = 0.0;
+        Y_S = sqrt(sigma_T * sigma_T + sigma_L * sigma_L + Y_S_temp) * z_S;
+    } else if (mdvar_internal == 1) { // accidental
+        Y_R = Y_T;
+        Y_S = sqrt(sigma_L * sigma_L + Y_S_temp) * z_S;
+    } else if (mdvar_internal == 2) { // mobile
+        Y_R = sqrt(sigma_T * sigma_T + sigma_L * sigma_L) * z_T;
+        Y_S = sqrt(Y_S_temp) * z_S;
+    } else {                          // broadcast
+        Y_R = Y_T + Y_L;
+        Y_S = sqrt(Y_S_temp) * z_S;
+    }
+
+    float result = A_ref - V_med - Y_R - Y_S;
+
+    // [Algorithm, Eqn 52]
+    if (result < 0.0)
+        result = result * (29.0 - result) / (29.0 - 10.0 * result);
+
+    return result;
+}
+
+// ============================================================================
+// Main — per-pixel ITM P2P computation
+// ============================================================================
 
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
@@ -69,14 +975,14 @@ void main() {
     int dr = r - uNodeCell.y;
     float dist_cells = sqrt(float(dc * dc + dr * dr));
 
-    /* Node's own cell */
+    // Node's own cell
     if (dist_cells < 0.5) {
         imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
         imageStore(uSignal, gid, vec4(-60.0, 0.0, 0.0, 0.0));
         return;
     }
 
-    /* Out of range */
+    // Out of range
     if (dist_cells > float(uMaxRangeCells)) {
         imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
         imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
@@ -85,139 +991,117 @@ void main() {
 
     float d_total = dist_cells * uCellMeters;
 
-    /* Extract terrain profile (up to MAX_PROFILE samples) */
+    // ---------------------------------------------------------------
+    // Extract terrain profile in PFL format:
+    //   pfl[0] = np (number of profile points minus 1)
+    //   pfl[1] = xi (step distance in meters)
+    //   pfl[2..np+2] = elevation values from TX to RX
+    // ---------------------------------------------------------------
     int n_raw = int(dist_cells) + 1;
     int step = 1;
-    if (n_raw > MAX_PROFILE) {
+    if (n_raw > MAX_PROFILE)
         step = (n_raw + MAX_PROFILE - 1) / MAX_PROFILE;
-    }
     int n_profile = min((n_raw + step - 1) / step, MAX_PROFILE);
-    float profile_step_m = uCellMeters * float(step);
 
-    /* Sample terrain profile and compute delta_h (terrain roughness) */
-    float profile[MAX_PROFILE];
-    float p_min = 1e30;
-    float p_max = -1e30;
+    float pfl[MAX_PROFILE + 2];
+    pfl[0] = float(n_profile - 1);          // np = number of intervals
+    pfl[1] = d_total / float(n_profile - 1); // xi = step distance
 
-    /* Also find max obstruction (Deygout) for diffraction */
-    float max_violation = 0.0;
-    float best_t = 0.0;
-
-    for (int i = 0; i < n_profile; ++i) {
-        float t = float(i * step) / dist_cells;
-        t = min(t, 1.0);
+    for (int i = 0; i < n_profile; i++) {
+        float t = float(i) / float(n_profile - 1);
         float sr = float(uNodeCell.y) + float(dr) * t;
         float sc = float(uNodeCell.x) + float(dc) * t;
         int si = clamp(int(sr), 0, uGridSize.y - 1);
         int sj = clamp(int(sc), 0, uGridSize.x - 1);
-        float elev = imageLoad(uElevation, ivec2(sj, si)).r;
-        profile[i] = elev;
-
-        /* Track min/max for roughness (exclude endpoints) */
-        if (i > 0 && i < n_profile - 1) {
-            p_min = min(p_min, elev);
-            p_max = max(p_max, elev);
-        }
-
-        /* Earth-curvature-corrected LOS check */
-        if (i > 0 && i < n_profile) {
-            float target_elev = imageLoad(uElevation, gid).r;
-            float d_along = d_total * t;
-            float d_remain = d_total * (1.0 - t);
-            float earth_curve = d_along * d_remain * uEarthCurveFactor;
-            float needed_h = uObserverHeight + (target_elev - uObserverHeight) * t - earth_curve;
-            float violation = elev - needed_h;
-            if (violation > max_violation) {
-                max_violation = violation;
-                best_t = t;
-            }
-        }
+        pfl[i + 2] = imageLoad(uElevation, ivec2(sj, si)).r;
     }
 
-    /* Delta-h: simplified as max-min of interior profile */
-    float delta_h = (n_profile > 2) ? max(p_max - p_min, 0.0) : 0.0;
-
-    /* Effective antenna heights */
-    float h1 = uObserverHeight - profile[0];
-    float h2 = uTargetHeight;
-    h1 = max(h1, 1.0);
-    h2 = max(h2, 1.0);
-
-    /* Free-space loss */
-    float fsl = fspl(d_total, uFreqMhz);
-
-    /* Horizon distances */
-    float dl1 = horizon_dist(h1);
-    float dl2 = horizon_dist(h2);
-    float dls = dl1 + dl2;
-
-    /* Diffraction loss */
-    float dfl = 0.0;
-    if (max_violation > 0.0) {
-        /* Knife-edge diffraction from Deygout obstruction */
-        float lambda = 299.792458 / uFreqMhz;
-        float d1 = d_total * best_t;
-        float d2 = d_total * (1.0 - best_t);
-        float d_harmonic = d1 * d2 / (d1 + d2);
-        float v = max_violation * sqrt(2.0 / (lambda * d_harmonic));
-        if (v > -0.78) {
-            dfl = 6.9 + 20.0 * log(sqrt((v - 0.1) * (v - 0.1) + 1.0) + v - 0.1) / log(10.0);
-        }
-    } else if (d_total > dls) {
-        /* Beyond smooth-earth LOS — add smooth-earth diffraction */
-        float d_excess = d_total - dls;
-        float lambda = 299.792458 / uFreqMhz;
-        float v = 2.0 * d_excess / sqrt(lambda * d_total);
-        if (v > -0.78) {
-            dfl = 6.9 + 20.0 * log(sqrt((v - 0.1) * (v - 0.1) + 1.0) + v - 0.1) / log(10.0);
-        }
+    int np = int(pfl[0]);
+    if (np < 2) {
+        // Not enough profile points — fall back to FSPL
+        float fsl = FreeSpaceLoss_ITM(d_total, uFreqMhz);
+        float eirp = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
+        float received = eirp - fsl + uRxAntennaGainDbi - uRxCableLossDb;
+        imageStore(uVisibility, gid, uvec4(received >= uRxSensitivityDbm ? 1u : 0u, 0, 0, 0));
+        imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
+        return;
     }
 
-    /* Ground impedance loss */
-    float gnd = ground_loss(uFreqMhz, uGroundDielectric, uGroundConductivity, uPolarization);
-
-    /* Terrain roughness adjustment (ITU-R P.1546 inspired)
-       delta_h is the terrain irregularity parameter.
-       Stronger scaling to match real-world propagation. */
-    float rough_adj = 0.0;
-    if (delta_h > 10.0) {
-        rough_adj = 10.0 * log(delta_h / 10.0) / log(10.0);
+    // ---------------------------------------------------------------
+    // Compute average path height (middle 80% of profile)
+    // ---------------------------------------------------------------
+    int p10 = int(0.1 * float(np));
+    float h_sys = 0.0;
+    int count = 0;
+    for (int i = p10; i <= np - p10; i++) {
+        h_sys += pfl[i + 2];
+        count++;
     }
+    if (count > 0) h_sys /= float(count);
 
-    /* Clutter/environment loss: accounts for ground clutter, vegetation, buildings.
-       Scales with distance — longer paths encounter more clutter. */
-    float clutter_db = 0.0;
-    float dist_km = d_total / 1000.0;
-    if (dist_km > 1.0) {
-        clutter_db = 6.0 * log(dist_km) / log(10.0); // ~6dB/decade of distance
-    }
+    // ---------------------------------------------------------------
+    // TX and RX structural heights
+    // ---------------------------------------------------------------
+    float h_tx = uObserverHeight - pfl[2];   // TX antenna height AGL
+    h_tx = max(h_tx, 1.0);
+    float h_rx = uTargetHeight;
+    h_rx = max(h_rx, 1.0);
 
-    /* Multiple obstruction penalty: single knife-edge underestimates loss when
-       terrain has multiple ridges. Scale diffraction loss based on roughness. */
-    if (dfl > 0.0 && delta_h > 50.0) {
-        float multi_ridge_factor = 1.0 + 0.5 * min(delta_h / 200.0, 1.0);
-        dfl *= multi_ridge_factor;
-    }
+    // ---------------------------------------------------------------
+    // Initialize: compute Z_g, gamma_e, N_s
+    // ---------------------------------------------------------------
+    vec2 Z_g;
+    float gamma_e, N_s;
+    InitializePointToPoint(uFreqMhz, h_sys, uRefractivity, uPolarization,
+        uGroundDielectric, uGroundConductivity, Z_g, gamma_e, N_s);
 
-    /* Total path loss: always include knife-edge diffraction when obstructed.
-       Distance-dependent smooth-earth diffraction only applies to unobstructed paths
-       beyond the LOS horizon. */
-    float total_loss = fsl + gnd + clutter_db;
+    // ---------------------------------------------------------------
+    // QuickPfl: extract terrain geometry
+    // ---------------------------------------------------------------
+    float theta_hzn_0, theta_hzn_1;
+    float d_hzn_0, d_hzn_1;
+    float h_e_0, h_e_1;
+    float delta_h, d_path;
 
-    if (max_violation > 0.0) {
-        /* Obstructed path — always apply knife-edge diffraction regardless of distance */
-        total_loss += dfl;
-    } else if (d_total > dls) {
-        /* Unobstructed but beyond smooth-earth horizon — smooth-earth diffraction */
-        total_loss += dfl;
-    }
+    QuickPfl(pfl, gamma_e, h_tx, h_rx,
+        theta_hzn_0, theta_hzn_1,
+        d_hzn_0, d_hzn_1,
+        h_e_0, h_e_1,
+        delta_h, d_path);
 
-    total_loss += rough_adj;
+    // Clamp effective heights to reasonable values
+    h_e_0 = max(h_e_0, 1.0);
+    h_e_1 = max(h_e_1, 1.0);
 
-    /* EIRP and received signal */
+    // ---------------------------------------------------------------
+    // LongleyRice: compute A_ref
+    // ---------------------------------------------------------------
+    int propmode;
+    float A_ref = LongleyRice(theta_hzn_0, theta_hzn_1, uFreqMhz, Z_g,
+        d_hzn_0, d_hzn_1, h_e_0, h_e_1,
+        gamma_e, N_s, delta_h, h_tx, h_rx, d_path, propmode);
+
+    // ---------------------------------------------------------------
+    // Free-space loss
+    // ---------------------------------------------------------------
+    float A_fs = FreeSpaceLoss_ITM(d_path, uFreqMhz);
+
+    // ---------------------------------------------------------------
+    // Variability
+    // ---------------------------------------------------------------
+    float A_var = Variability(uTimePct, uLocationPct, uSituationPct,
+        h_e_0, h_e_1, delta_h, uFreqMhz,
+        d_path, A_ref, uClimate, uMdvar);
+
+    float A_db = A_var + A_fs;
+
+    // ---------------------------------------------------------------
+    // Link budget: received signal
+    // ---------------------------------------------------------------
     float eirp = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
-    float received = eirp - total_loss + uRxAntennaGainDbi - uRxCableLossDb;
+    float received = eirp - A_db + uRxAntennaGainDbi - uRxCableLossDb;
 
+    // Write results
     if (received >= uRxSensitivityDbm) {
         imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
     } else {

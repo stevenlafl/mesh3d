@@ -92,7 +92,7 @@ private:
 
     /* Propagation model selection */
     mesh3d_prop_model_t m_prop_model = MESH3D_PROP_ITM;
-    mesh3d_itm_params_t m_itm_params{5, 15.0f, 0.005f, 1, 50.0f, 50.0f};
+    mesh3d_itm_params_t m_itm_params{5, 15.0f, 0.005f, 1, 50.0f, 50.0f, 301.0f, 50.0f, 12};
 
     /* Receiver / display config */
     mesh3d_rf_config_t m_rf_config{-130.0f, 1.0f, 2.0f, 2.0f, -130.0f, -80.0f};
@@ -108,6 +108,18 @@ private:
     void create_textures(int rows, int cols);
     void destroy_textures();
     void clear_merge_textures();
+
+    /* Set uniforms that are constant across all nodes (grid, environment, RX).
+       Must be called after active_shader->use(). */
+    void set_environment_uniforms(ComputeShader* shader);
+
+    /* Set per-node TX uniforms from node hardware profile.
+       Must be called after set_environment_uniforms(). */
+    void set_node_uniforms(ComputeShader* shader, const NodeData& nd,
+                           int nc, int nr, float observer_height);
+
+    /* Dispatch merge pass after each node's viewshed pass. */
+    void dispatch_merge(GLuint groups_x, GLuint groups_y);
 };
 
 } // namespace mesh3d

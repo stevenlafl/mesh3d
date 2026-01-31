@@ -12,7 +12,10 @@ inline mesh3d_itm_params_t itm_defaults() {
         0.005f,  // ground_conductivity S/m
         1,       // polarization: vertical
         50.0f,   // situation_pct
-        50.0f    // time_pct
+        50.0f,   // time_pct
+        301.0f,  // refractivity (N_0)
+        50.0f,   // location_pct
+        12       // mdvar (broadcast + eliminate direct situation variability)
     };
 }
 
