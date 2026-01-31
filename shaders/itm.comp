@@ -37,6 +37,7 @@ uniform float uLocationPct;        // 0 < loc < 100, default 50
 uniform float uSituationPct;       // 0 < sit < 100, default 50
 uniform float uTimePct;            // 0 < time < 100, default 50
 uniform int   uMdvar;              // mode of variability, default 12
+uniform int   uRowOffset;          // row offset for chunked dispatch (0 = full grid)
 
 // ============================================================================
 // Constants
@@ -349,11 +350,12 @@ float ComputeDeltaH(float pfl[MAX_PROFILE + 2], float d_start, float d_end) {
     // Store resampled elevations
     float s_elev[MAX_DELTA_H];
     for (int j = 0; j < n; j++) {
-        while (xs > 0.0 && (ii + 1) < np) {
+        while (xs > 0.0 && ii < np) {
             xs -= 1.0;
             ii++;
         }
-        s_elev[j] = pfl[ii + 3] + (pfl[ii + 3] - pfl[ii + 2]) * xs;
+        int idx = max(ii, 1);  // guard against accessing pfl[1] (= xi, not elevation)
+        s_elev[j] = pfl[idx + 2] + (pfl[idx + 2] - pfl[idx + 1]) * xs;
         xs += x_end_step;
     }
 
@@ -402,13 +404,7 @@ float ComputeDeltaH(float pfl[MAX_PROFILE + 2], float d_start, float d_end) {
     float q10 = diffs[p10 - 1];
     float q90 = diffs[p90];
 
-    float delta_h_d = q10 - q90;
-
-    // Invert the TerrainRoughness scaling
-    float range = d_end - d_start;
-    float factor = 1.0 - 0.8 * exp(-range / 50e3);
-    if (factor < 0.01) factor = 0.01;
-    return delta_h_d / factor;
+    return q10 - q90;
 }
 
 // ============================================================================
@@ -966,7 +962,10 @@ float Variability(float time_pct, float location_pct, float situation_pct,
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     int c = gid.x;
-    int r = gid.y;
+    int r = gid.y + uRowOffset;
+
+    // Adjust gid.y to actual row for imageStore
+    ivec2 store_gid = ivec2(c, r);
 
     if (c >= uGridSize.x || r >= uGridSize.y)
         return;
@@ -977,19 +976,34 @@ void main() {
 
     // Node's own cell
     if (dist_cells < 0.5) {
-        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(-60.0, 0.0, 0.0, 0.0));
+        imageStore(uVisibility, store_gid, uvec4(1, 0, 0, 0));
+        imageStore(uSignal, store_gid, vec4(-60.0, 0.0, 0.0, 0.0));
         return;
     }
 
     // Out of range
     if (dist_cells > float(uMaxRangeCells)) {
-        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
+        imageStore(uVisibility, store_gid, uvec4(0, 0, 0, 0));
+        imageStore(uSignal, store_gid, vec4(-999.0, 0.0, 0.0, 0.0));
         return;
     }
 
     float d_total = dist_cells * uCellMeters;
+
+    // ---------------------------------------------------------------
+    // FSPL early-out: if even free-space can't reach receiver, skip ITM.
+    // ITM always adds more loss than FSPL, so this is a safe upper bound.
+    // ---------------------------------------------------------------
+    {
+        float eirp_eo = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
+        float fspl_eo = FreeSpaceLoss_ITM(d_total, uFreqMhz);
+        float best_possible = eirp_eo - fspl_eo + uRxAntennaGainDbi - uRxCableLossDb;
+        if (best_possible < uRxSensitivityDbm) {
+            imageStore(uVisibility, store_gid, uvec4(0, 0, 0, 0));
+            imageStore(uSignal, store_gid, vec4(-999.0, 0.0, 0.0, 0.0));
+            return;
+        }
+    }
 
     // ---------------------------------------------------------------
     // Extract terrain profile in PFL format:
@@ -1022,8 +1036,8 @@ void main() {
         float fsl = FreeSpaceLoss_ITM(d_total, uFreqMhz);
         float eirp = uTxPowerDbm + uAntennaGainDbi - uCableLossDb;
         float received = eirp - fsl + uRxAntennaGainDbi - uRxCableLossDb;
-        imageStore(uVisibility, gid, uvec4(received >= uRxSensitivityDbm ? 1u : 0u, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
+        imageStore(uVisibility, store_gid, uvec4(received >= uRxSensitivityDbm ? 1u : 0u, 0, 0, 0));
+        imageStore(uSignal, store_gid, vec4(received, 0.0, 0.0, 0.0));
         return;
     }
 
@@ -1103,9 +1117,9 @@ void main() {
 
     // Write results
     if (received >= uRxSensitivityDbm) {
-        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+        imageStore(uVisibility, store_gid, uvec4(1, 0, 0, 0));
     } else {
-        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
+        imageStore(uVisibility, store_gid, uvec4(0, 0, 0, 0));
     }
-    imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
+    imageStore(uSignal, store_gid, vec4(received, 0.0, 0.0, 0.0));
 }

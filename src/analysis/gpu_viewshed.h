@@ -105,6 +105,27 @@ private:
     ComputeState m_state = ComputeState::IDLE;
     GLsync m_fence = nullptr;
 
+    /* Chunked dispatch: breaks each node's viewshed into row-bands so the
+       GPU can interleave render work between chunks. */
+    static constexpr int ROWS_PER_CHUNK = 128;
+
+    struct ChunkNode {
+        NodeData data;
+        int col, row;
+        float observer_height;
+    };
+
+    struct ChunkState {
+        std::vector<ChunkNode> nodes;
+        size_t current_node = 0;
+        int current_row = 0;
+        bool merge_pending = false;
+        ComputeShader* active_shader = nullptr;
+        GLuint groups_x = 0;
+    };
+
+    ChunkState m_chunk;
+
     void create_textures(int rows, int cols);
     void destroy_textures();
     void clear_merge_textures();
@@ -120,6 +141,15 @@ private:
 
     /* Dispatch merge pass after each node's viewshed pass. */
     void dispatch_merge(GLuint groups_x, GLuint groups_y);
+
+    /* Dispatch one row-band of the viewshed shader for the current chunk node. */
+    void dispatch_viewshed_band();
+
+    /* Advance chunked dispatch state machine (called when fence is signaled). */
+    void advance_chunk();
+
+    /* Place a GPU fence and flush. */
+    void place_fence();
 };
 
 } // namespace mesh3d

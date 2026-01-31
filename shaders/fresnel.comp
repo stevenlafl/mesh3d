@@ -19,6 +19,7 @@ uniform float uEarthCurveFactor;
 uniform float uRxAntennaGainDbi;
 uniform float uRxCableLossDb;
 uniform float uTargetHeight;     // default 2.0m
+uniform int   uRowOffset;          // row offset for chunked dispatch (0 = full grid)
 
 const float PI = 3.141592653589793;
 const int MAX_PROFILE = 512;
@@ -26,7 +27,8 @@ const int MAX_PROFILE = 512;
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     int c = gid.x;
-    int r = gid.y;
+    int r = gid.y + uRowOffset;
+    ivec2 store_gid = ivec2(c, r);
 
     if (c >= uGridSize.x || r >= uGridSize.y)
         return;
@@ -37,21 +39,21 @@ void main() {
 
     /* Node's own cell */
     if (dist_cells < 0.5) {
-        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(-60.0, 0.0, 0.0, 0.0));
+        imageStore(uVisibility, store_gid, uvec4(1, 0, 0, 0));
+        imageStore(uSignal, store_gid, vec4(-60.0, 0.0, 0.0, 0.0));
         return;
     }
 
     /* Out of range */
     if (dist_cells > float(uMaxRangeCells)) {
-        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
+        imageStore(uVisibility, store_gid, uvec4(0, 0, 0, 0));
+        imageStore(uSignal, store_gid, vec4(-999.0, 0.0, 0.0, 0.0));
         return;
     }
 
     float d_total = dist_cells * uCellMeters;
     float lambda = 299.792458 / uFreqMhz;
-    float target_elev = imageLoad(uElevation, gid).r;
+    float target_elev = imageLoad(uElevation, store_gid).r;
     float rx_h = target_elev + uTargetHeight;
 
     /* Extract terrain profile */
@@ -255,9 +257,9 @@ void main() {
     float received = eirp - fspl - max(diff_loss_db, 0.0) + uRxAntennaGainDbi - uRxCableLossDb;
 
     if (received >= uRxSensitivityDbm) {
-        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
+        imageStore(uVisibility, store_gid, uvec4(1, 0, 0, 0));
     } else {
-        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
+        imageStore(uVisibility, store_gid, uvec4(0, 0, 0, 0));
     }
-    imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
+    imageStore(uSignal, store_gid, vec4(received, 0.0, 0.0, 0.0));
 }

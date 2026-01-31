@@ -196,10 +196,9 @@ void GpuViewshed::set_grid_params(const mesh3d_bounds_t& bounds, int rows, int c
 void GpuViewshed::set_environment_uniforms(ComputeShader* shader) {
     /* Grid geometry */
     shader->set_ivec2("uGridSize", m_cols, m_rows);
+    shader->set_int("uRowOffset", 0);
     shader->set_float("uCellMeters", m_cell_meters);
     shader->set_float("uEarthCurveFactor", 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f));
-    shader->set_int("uMaxRangeCells", static_cast<int>(
-        std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols))));
 
     /* RX config (same receiver assumed at every pixel) */
     shader->set_float("uRxAntennaGainDbi", m_rf_config.rx_antenna_gain_dbi);
@@ -244,6 +243,12 @@ void GpuViewshed::set_node_uniforms(ComputeShader* shader, const NodeData& nd,
     shader->set_float("uFreqMhz", freq_mhz);
     shader->set_float("uCableLossDb", nd.info.cable_loss_db);
     shader->set_float("uRxSensitivityDbm", rx_sens);
+
+    /* Max range = grid diagonal (the propagation model + FSPL early-out
+       naturally limit coverage; no artificial radius cutoff). */
+    int grid_diag = static_cast<int>(
+        std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols)));
+    shader->set_int("uMaxRangeCells", grid_diag);
 }
 
 /* -----------------------------------------------------------------------
@@ -324,70 +329,151 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
                                       const float* cpu_elevation) {
     if (!m_initialized || m_rows == 0 || m_cols == 0) return;
 
-    auto t_start = std::chrono::steady_clock::now();
-
     clear_merge_textures();
 
-    GLuint groups_x = (m_cols + 15) / 16;
-    GLuint groups_y = (m_rows + 15) / 16;
-
-    double lat_res = (m_bounds.max_lat - m_bounds.min_lat) / (m_rows - 1);
-    double lon_res = (m_bounds.max_lon - m_bounds.min_lon) / (m_cols - 1);
-
+    /* Select propagation shader */
     ComputeShader* active_shader = &m_viewshed_shader;
     if (m_prop_model == MESH3D_PROP_ITM && m_has_itm)
         active_shader = &m_itm_shader;
     else if (m_prop_model == MESH3D_PROP_FRESNEL && m_has_fresnel)
         active_shader = &m_fresnel_shader;
 
+    double lat_res = (m_bounds.max_lat - m_bounds.min_lat) / (m_rows - 1);
+    double lon_res = (m_bounds.max_lon - m_bounds.min_lon) / (m_cols - 1);
+
+    /* Pre-compute per-node data so we don't need cpu_elevation later */
+    m_chunk = {};
+    m_chunk.active_shader = active_shader;
+    m_chunk.groups_x = (m_cols + 15) / 16;
+
     for (auto& nd : nodes) {
         int nr = static_cast<int>((m_bounds.max_lat - nd.info.lat) / lat_res);
         int nc = static_cast<int>((nd.info.lon - m_bounds.min_lon) / lon_res);
-
         int nr_elev = std::clamp(nr, 0, m_rows - 1);
         int nc_elev = std::clamp(nc, 0, m_cols - 1);
         float node_elev = cpu_elevation[nr_elev * m_cols + nc_elev];
-
         float antenna_h = nd.info.antenna_height_m;
         if (antenna_h < 1.0f) antenna_h = 2.0f;
+        m_chunk.nodes.push_back({nd, nc, nr, node_elev + antenna_h});
+    }
 
-        /* --- Viewshed pass --- */
-        active_shader->use();
-        set_environment_uniforms(active_shader);
-        set_node_uniforms(active_shader, nd, nc, nr, node_elev + antenna_h);
+    if (m_chunk.nodes.empty()) return;
+
+    /* Start first node, first row-band */
+    m_chunk.current_node = 0;
+    m_chunk.current_row = 0;
+    m_chunk.merge_pending = false;
+
+    auto& first = m_chunk.nodes[0];
+    active_shader->use();
+    set_environment_uniforms(active_shader);
+    set_node_uniforms(active_shader, first.data, first.col, first.row, first.observer_height);
+
+    glBindImageTexture(0, m_elevation_tex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
+    glBindImageTexture(1, m_node_vis_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
+    glBindImageTexture(2, m_node_sig_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
+
+    dispatch_viewshed_band();
+    place_fence();
+
+    m_state = ComputeState::DISPATCHED;
+
+    LOG_INFO("compute_all_async: started chunked dispatch for %zu nodes on %dx%d grid (%d rows/chunk)",
+             nodes.size(), m_cols, m_rows, ROWS_PER_CHUNK);
+}
+
+/* -----------------------------------------------------------------------
+ * Dispatch one row-band of the viewshed shader.
+ * The shader uses uRowOffset to map gl_GlobalInvocationID.y to actual rows.
+ * ----------------------------------------------------------------------- */
+void GpuViewshed::dispatch_viewshed_band() {
+    int row_start = m_chunk.current_row;
+    int row_end = std::min(row_start + ROWS_PER_CHUNK, m_rows);
+    int chunk_rows = row_end - row_start;
+    GLuint chunk_groups_y = (chunk_rows + 15) / 16;
+
+    m_chunk.active_shader->set_int("uRowOffset", row_start);
+    m_chunk.active_shader->dispatch(m_chunk.groups_x, chunk_groups_y, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+}
+
+/* -----------------------------------------------------------------------
+ * Place a GPU fence and flush the command queue.
+ * ----------------------------------------------------------------------- */
+void GpuViewshed::place_fence() {
+    if (m_fence) glDeleteSync(m_fence);
+    m_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+}
+
+/* -----------------------------------------------------------------------
+ * Advance the chunked dispatch state machine.
+ * Called from poll_state() when the current fence is signaled.
+ * ----------------------------------------------------------------------- */
+void GpuViewshed::advance_chunk() {
+    if (m_chunk.merge_pending) {
+        /* Merge just completed — move to next node */
+        m_chunk.merge_pending = false;
+        m_chunk.current_node++;
+        m_chunk.current_row = 0;
+
+        if (m_chunk.current_node >= m_chunk.nodes.size()) {
+            /* All nodes done */
+            m_chunk.nodes.clear();
+            m_state = ComputeState::READY;
+            return;
+        }
+
+        /* Set up next node's uniforms */
+        auto& node = m_chunk.nodes[m_chunk.current_node];
+        m_chunk.active_shader->use();
+        set_node_uniforms(m_chunk.active_shader, node.data,
+                          node.col, node.row, node.observer_height);
 
         glBindImageTexture(0, m_elevation_tex, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32F);
         glBindImageTexture(1, m_node_vis_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8UI);
         glBindImageTexture(2, m_node_sig_tex,  0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
 
-        active_shader->dispatch(groups_x, groups_y, 1);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        dispatch_viewshed_band();
+        place_fence();
+    } else {
+        /* Viewshed band completed — advance to next band or merge */
+        m_chunk.current_row += ROWS_PER_CHUNK;
 
-        /* --- Merge: OR visibility, MAX signal, increment overlap --- */
-        dispatch_merge(groups_x, groups_y);
+        if (m_chunk.current_row < m_rows) {
+            /* More row-bands to dispatch for this node */
+            m_chunk.active_shader->use();
+            dispatch_viewshed_band();
+            place_fence();
+        } else {
+            /* All bands done for this node — dispatch merge pass */
+            GLuint groups_x = (m_cols + 15) / 16;
+            GLuint groups_y = (m_rows + 15) / 16;
+            dispatch_merge(groups_x, groups_y);
+            m_chunk.merge_pending = true;
+            place_fence();
+        }
     }
-
-    /* Place fence after all dispatches — no GPU sync until poll_state() */
-    if (m_fence) glDeleteSync(m_fence);
-    m_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    glFlush(); // ensure fence is submitted to GPU command queue
-    m_state = ComputeState::DISPATCHED;
-
-    auto t_end = std::chrono::steady_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-    LOG_INFO("compute_all_async: dispatched %zu nodes on %dx%d grid in %lld ms",
-             nodes.size(), m_cols, m_rows, (long long)ms);
 }
 
 ComputeState GpuViewshed::poll_state() {
     if (m_state != ComputeState::DISPATCHED) return m_state;
 
     GLenum result = glClientWaitSync(m_fence, 0, 0); // timeout=0 -> non-blocking
-    if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
-        glDeleteSync(m_fence);
-        m_fence = nullptr;
-        m_state = ComputeState::READY;
+    if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED)
+        return m_state; // still running
+
+    glDeleteSync(m_fence);
+    m_fence = nullptr;
+
+    /* If chunked dispatch is active, advance state machine */
+    if (!m_chunk.nodes.empty()) {
+        advance_chunk();
+        return m_state;
     }
+
+    /* Non-chunked path (shouldn't happen currently) */
+    m_state = ComputeState::READY;
     return m_state;
 }
 

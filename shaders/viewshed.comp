@@ -18,11 +18,13 @@ uniform float uRxSensitivityDbm;
 uniform float uEarthCurveFactor; // 1.0 / (2 * 4/3 * 6371000)
 uniform float uRxAntennaGainDbi;
 uniform float uRxCableLossDb;
+uniform int   uRowOffset;          // row offset for chunked dispatch (0 = full grid)
 
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     int c = gid.x;
-    int r = gid.y;
+    int r = gid.y + uRowOffset;
+    ivec2 store_gid = ivec2(c, r);
 
     if (c >= uGridSize.x || r >= uGridSize.y)
         return;
@@ -33,20 +35,20 @@ void main() {
 
     /* Node's own cell */
     if (dist_cells < 0.5) {
-        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(-60.0, 0.0, 0.0, 0.0));
+        imageStore(uVisibility, store_gid, uvec4(1, 0, 0, 0));
+        imageStore(uSignal, store_gid, vec4(-60.0, 0.0, 0.0, 0.0));
         return;
     }
 
     /* Out of range */
     if (dist_cells > float(uMaxRangeCells)) {
-        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(-999.0, 0.0, 0.0, 0.0));
+        imageStore(uVisibility, store_gid, uvec4(0, 0, 0, 0));
+        imageStore(uSignal, store_gid, vec4(-999.0, 0.0, 0.0, 0.0));
         return;
     }
 
     /* Ray-march with earth curvature correction and diffraction */
-    float target_elev = imageLoad(uElevation, gid).r;
+    float target_elev = imageLoad(uElevation, store_gid).r;
     int steps = int(dist_cells * 1.5) + 1;
     float d_total = dist_cells * uCellMeters;
 
@@ -107,6 +109,6 @@ void main() {
     /* Visibility: 1 = signal reaches receiver above sensitivity.
        Signal is always written so the shader can threshold by display range. */
     uint vis = (received >= uRxSensitivityDbm) ? 1u : 0u;
-    imageStore(uVisibility, gid, uvec4(vis, 0, 0, 0));
-    imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
+    imageStore(uVisibility, store_gid, uvec4(vis, 0, 0, 0));
+    imageStore(uSignal, store_gid, vec4(received, 0.0, 0.0, 0.0));
 }
