@@ -124,12 +124,22 @@ private:
     void update_dynamic_tiles(double cam_lat, double cam_lon);
 
     /* Tile-mode viewshed state: tracks per-tile GPU compute progress */
+    struct CompositeInfo {
+        int comp_rows = 0, comp_cols = 0;
+        int center_row_start = 0, center_col_start = 0;
+        int center_rows = 0, center_cols = 0;
+    };
     struct TileViewshedState {
         bool active = false;
         size_t current_tile = 0;
         std::vector<TileCoord> tile_list;
+        std::vector<CompositeInfo> comp_info; // one per tile
     };
     TileViewshedState m_tile_vs;
+
+    /* Helper: dispatch async viewshed for a tile using composite elevation */
+    void dispatch_tile_viewshed(size_t tile_idx, const std::vector<NodeData>& nodes,
+                                 GpuViewshed* gpu);
 };
 
 } // namespace mesh3d

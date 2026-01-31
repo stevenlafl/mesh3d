@@ -174,25 +174,42 @@ void main() {
     /* Ground impedance loss */
     float gnd = ground_loss(uFreqMhz, uGroundDielectric, uGroundConductivity, uPolarization);
 
-    /* Terrain roughness adjustment */
+    /* Terrain roughness adjustment (ITU-R P.1546 inspired)
+       delta_h is the terrain irregularity parameter.
+       Stronger scaling to match real-world propagation. */
     float rough_adj = 0.0;
     if (delta_h > 10.0) {
-        rough_adj = 5.0 * log(delta_h / 10.0) / log(10.0);
+        rough_adj = 10.0 * log(delta_h / 10.0) / log(10.0);
     }
 
-    /* Total path loss with smooth transition */
-    float total_loss;
-    if (d_total < dls * 0.5) {
-        total_loss = fsl + gnd + 0.1 * delta_h / max(h1, 1.0);
-    } else if (d_total < dls * 2.0) {
-        float t_blend = (d_total - dls * 0.5) / (dls * 1.5);
-        t_blend = clamp(t_blend, 0.0, 1.0);
-        float los_loss = fsl + gnd;
-        float diff_total = fsl + dfl + gnd;
-        total_loss = mix(los_loss, diff_total, t_blend);
-    } else {
-        total_loss = fsl + dfl + gnd;
+    /* Clutter/environment loss: accounts for ground clutter, vegetation, buildings.
+       Scales with distance — longer paths encounter more clutter. */
+    float clutter_db = 0.0;
+    float dist_km = d_total / 1000.0;
+    if (dist_km > 1.0) {
+        clutter_db = 6.0 * log(dist_km) / log(10.0); // ~6dB/decade of distance
     }
+
+    /* Multiple obstruction penalty: single knife-edge underestimates loss when
+       terrain has multiple ridges. Scale diffraction loss based on roughness. */
+    if (dfl > 0.0 && delta_h > 50.0) {
+        float multi_ridge_factor = 1.0 + 0.5 * min(delta_h / 200.0, 1.0);
+        dfl *= multi_ridge_factor;
+    }
+
+    /* Total path loss: always include knife-edge diffraction when obstructed.
+       Distance-dependent smooth-earth diffraction only applies to unobstructed paths
+       beyond the LOS horizon. */
+    float total_loss = fsl + gnd + clutter_db;
+
+    if (max_violation > 0.0) {
+        /* Obstructed path — always apply knife-edge diffraction regardless of distance */
+        total_loss += dfl;
+    } else if (d_total > dls) {
+        /* Unobstructed but beyond smooth-earth horizon — smooth-earth diffraction */
+        total_loss += dfl;
+    }
+
     total_loss += rough_adj;
 
     /* EIRP and received signal */

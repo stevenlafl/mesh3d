@@ -88,7 +88,7 @@ private:
     float m_cell_meters = 30.0f;
 
     /* Propagation model selection */
-    mesh3d_prop_model_t m_prop_model = MESH3D_PROP_FSPL;
+    mesh3d_prop_model_t m_prop_model = MESH3D_PROP_ITM;
     mesh3d_itm_params_t m_itm_params{5, 15.0f, 0.005f, 1, 50.0f, 50.0f};
 
     bool m_initialized = false;

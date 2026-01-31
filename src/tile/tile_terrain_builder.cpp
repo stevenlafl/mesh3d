@@ -33,8 +33,9 @@ Mesh TileTerrainBuilder::build_mesh(const TileData& data, const GeoProjection& p
     td.cols = data.elev_cols;
     td.bounds = data.bounds;
     td.elevation_scale = elevation_scale;
-    td.viewshed = data.viewshed.empty() ? nullptr : data.viewshed.data();
-    td.signal = data.signal.empty() ? nullptr : data.signal.data();
+    /* Viewshed/signal use overlay textures in tile mode — don't bake into vertices */
+    td.viewshed = nullptr;
+    td.signal = nullptr;
 
     return build_terrain_mesh(td, proj);
 }
@@ -46,8 +47,9 @@ Mesh TileTerrainBuilder::rebuild_mesh(const TileRenderable& tr, const GeoProject
     td.cols = tr.elev_cols;
     td.bounds = tr.bounds;
     td.elevation_scale = elevation_scale;
-    td.viewshed = tr.viewshed.empty() ? nullptr : tr.viewshed.data();
-    td.signal = tr.signal.empty() ? nullptr : tr.signal.data();
+    /* Viewshed/signal use overlay textures in tile mode — don't bake into vertices */
+    td.viewshed = nullptr;
+    td.signal = nullptr;
 
     return build_terrain_mesh(td, proj);
 }

@@ -205,11 +205,13 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
         active_shader = &m_fresnel_shader;
 
     for (auto& nd : nodes) {
-        /* Map node to grid cell */
+        /* Map node to grid cell (may be off-grid for cross-tile bleed) */
         int nr = static_cast<int>((m_bounds.max_lat - nd.info.lat) / lat_res);
         int nc = static_cast<int>((nd.info.lon - m_bounds.min_lon) / lon_res);
-        nr = std::clamp(nr, 0, m_rows - 1);
-        nc = std::clamp(nc, 0, m_cols - 1);
+
+        /* Use nearest edge cell for elevation lookup when node is off-grid */
+        int nr_elev = std::clamp(nr, 0, m_rows - 1);
+        int nc_elev = std::clamp(nc, 0, m_cols - 1);
 
         /* Read node elevation at grid cell from GPU texture */
         float node_elev = 0.0f;
@@ -219,7 +221,7 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                    GL_TEXTURE_2D, m_elevation_tex, 0);
-            glReadPixels(nc, nr, 1, 1, GL_RED, GL_FLOAT, &node_elev);
+            glReadPixels(nc_elev, nr_elev, 1, 1, GL_RED, GL_FLOAT, &node_elev);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glDeleteFramebuffers(1, &fbo);
         }
@@ -237,16 +239,10 @@ void GpuViewshed::compute_all(const std::vector<NodeData>& nodes) {
         float rx_sens = nd.info.rx_sensitivity_dbm;
         if (rx_sens >= 0) rx_sens = -132.0f;
 
-        /* Max range from link budget, capped at grid diagonal */
+        /* Max range: full grid diagonal — let signal attenuation handle clipping */
         float eirp = tx_power_dbm + antenna_gain - cable_loss;
-        float max_path_loss = eirp - rx_sens;
-        float log_d_km = (max_path_loss - 20.0f * std::log10(freq_mhz) - 32.44f) / 20.0f;
-        float max_range_km = std::pow(10.0f, log_d_km);
-        float grid_diag_km = std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols))
-                             * m_cell_meters / 1000.0f;
-        if (max_range_km > grid_diag_km) max_range_km = grid_diag_km;
-        int max_range_cells = static_cast<int>(max_range_km * 1000.0f / m_cell_meters);
-        if (max_range_cells < 1) max_range_cells = 1;
+        int max_range_cells = static_cast<int>(
+            std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols)));
 
         /* Earth curvature factor: 1 / (2 * k * Re) where k=4/3, Re=6371000m */
         float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
@@ -325,14 +321,14 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
         active_shader = &m_fresnel_shader;
 
     for (auto& nd : nodes) {
-        /* Map node to grid cell */
+        /* Map node to grid cell (may be off-grid for cross-tile bleed) */
         int nr = static_cast<int>((m_bounds.max_lat - nd.info.lat) / lat_res);
         int nc = static_cast<int>((nd.info.lon - m_bounds.min_lon) / lon_res);
-        nr = std::clamp(nr, 0, m_rows - 1);
-        nc = std::clamp(nc, 0, m_cols - 1);
 
-        /* Look up node elevation from CPU-side array (avoids glReadPixels stall) */
-        float node_elev = cpu_elevation[nr * m_cols + nc];
+        /* Use nearest edge cell for elevation lookup when node is off-grid */
+        int nr_elev = std::clamp(nr, 0, m_rows - 1);
+        int nc_elev = std::clamp(nc, 0, m_cols - 1);
+        float node_elev = cpu_elevation[nr_elev * m_cols + nc_elev];
 
         float antenna_h = nd.info.antenna_height_m;
         if (antenna_h < 1.0f) antenna_h = 2.0f;
@@ -347,21 +343,10 @@ void GpuViewshed::compute_all_async(const std::vector<NodeData>& nodes,
         float rx_sens = nd.info.rx_sensitivity_dbm;
         if (rx_sens >= 0) rx_sens = -132.0f;
 
-        /* Max range from link budget: EIRP - FSPL = rx_sensitivity
-           Solve for distance where FSPL alone exceeds the link budget.
-           This is the absolute physical limit — terrain further reduces coverage. */
+        /* Max range: full grid diagonal — let signal attenuation handle clipping */
         float eirp = tx_power_dbm + antenna_gain - cable_loss;
-        float max_path_loss = eirp - rx_sens;
-        float log_d_km = (max_path_loss - 20.0f * std::log10(freq_mhz) - 32.44f) / 20.0f;
-        float max_range_km = std::pow(10.0f, log_d_km);
-
-        /* Cap at grid diagonal */
-        float grid_diag_km = std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols))
-                             * m_cell_meters / 1000.0f;
-        if (max_range_km > grid_diag_km) max_range_km = grid_diag_km;
-
-        int max_range_cells = static_cast<int>(max_range_km * 1000.0f / m_cell_meters);
-        if (max_range_cells < 1) max_range_cells = 1;
+        int max_range_cells = static_cast<int>(
+            std::sqrt(static_cast<float>(m_rows * m_rows + m_cols * m_cols)));
 
         float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
 

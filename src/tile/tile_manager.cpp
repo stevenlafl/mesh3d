@@ -336,24 +336,117 @@ float TileManager::get_elevation_at(float world_x, float world_z,
     return h0 + fr * (h1 - h0);
 }
 
-/* Filter nodes to only those within the tile's geographic bounds.
-   Nodes outside the tile get clamped to the edge by the compute shader,
-   producing false signal strips along tile boundaries. */
-static std::vector<NodeData> nodes_in_bounds(const std::vector<NodeData>& nodes,
-                                              const mesh3d_bounds_t& bounds) {
-    std::vector<NodeData> result;
-    for (auto& nd : nodes) {
-        if (nd.info.lat >= bounds.min_lat && nd.info.lat <= bounds.max_lat &&
-            nd.info.lon >= bounds.min_lon && nd.info.lon <= bounds.max_lon) {
-            result.push_back(nd);
+/* Build a composite elevation grid from a center tile + its cached neighbors.
+   The center tile occupies a sub-region within the larger composite grid,
+   so ray marching can traverse terrain on neighboring tiles. */
+struct CompositeElevation {
+    std::vector<float> data;
+    mesh3d_bounds_t bounds;
+    int rows = 0, cols = 0;
+    int center_row_start = 0, center_col_start = 0;
+    int center_rows = 0, center_cols = 0;
+};
+
+static CompositeElevation build_composite_elevation(
+    const TileRenderable& center, TileCache& cache)
+{
+    CompositeElevation ce;
+    ce.center_rows = center.elev_rows;
+    ce.center_cols = center.elev_cols;
+
+    const int cr = center.elev_rows;
+    const int cc = center.elev_cols;
+
+    /* Check 3x3 neighborhood for cached tiles with matching resolution.
+       nb[grid_row][grid_col]: grid_row 0 = north (max_lat), 2 = south (min_lat).
+       Tile coord systems:
+         - HGT (z=-1): y = floor(lat), so dy=+1 means NORTH → grid row 0
+         - Slippy map:  y increases southward, so dy=-1 means NORTH → grid row 0 */
+    const TileRenderable* nb[3][3] = {};
+    nb[1][1] = &center;
+    bool hgt_mode = (center.coord.z == -1);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dy == 0 && dx == 0) continue;
+            TileCoord nc = {center.coord.z, center.coord.x + dx, center.coord.y + dy};
+            TileRenderable* n = cache.get(nc);
+            if (n && n->elev_rows == cr && n->elev_cols == cc && !n->elevation.empty()) {
+                /* Map tile offset to grid position (north=row 0) */
+                int gr = hgt_mode ? (1 - dy) : (1 + dy); // HGT: +dy=north=0, slippy: -dy=north=0
+                int gc = dx + 1;
+                nb[gr][gc] = n;
+            }
         }
     }
-    return result;
+
+    /* Only expand in directions where neighbors exist */
+    int top_rows    = nb[0][0] || nb[0][1] || nb[0][2] ? cr : 0;
+    int bottom_rows = nb[2][0] || nb[2][1] || nb[2][2] ? cr : 0;
+    int left_cols   = nb[0][0] || nb[1][0] || nb[2][0] ? cc : 0;
+    int right_cols  = nb[0][2] || nb[1][2] || nb[2][2] ? cc : 0;
+
+    ce.rows = top_rows + cr + bottom_rows;
+    ce.cols = left_cols + cc + right_cols;
+    ce.center_row_start = top_rows;
+    ce.center_col_start = left_cols;
+
+    ce.data.assign(ce.rows * ce.cols, 0.0f);
+
+    /* Blit each neighbor's elevation into the composite */
+    for (int gr = 0; gr < 3; ++gr) {
+        for (int gc = 0; gc < 3; ++gc) {
+            if (!nb[gr][gc]) continue;
+            int dst_r = (gr == 0) ? 0 : (gr == 1 ? top_rows : top_rows + cr);
+            int dst_c = (gc == 0) ? 0 : (gc == 1 ? left_cols : left_cols + cc);
+            const auto& elev = nb[gr][gc]->elevation;
+            for (int r = 0; r < cr; ++r) {
+                std::memcpy(&ce.data[(dst_r + r) * ce.cols + dst_c],
+                            &elev[r * cc],
+                            cc * sizeof(float));
+            }
+        }
+    }
+
+    /* Expanded geographic bounds. Grid row 0 = north (max_lat). */
+    double lat_span = center.bounds.max_lat - center.bounds.min_lat;
+    double lon_span = center.bounds.max_lon - center.bounds.min_lon;
+
+    ce.bounds.max_lat = center.bounds.max_lat + (top_rows > 0 ? lat_span : 0.0);
+    ce.bounds.min_lat = center.bounds.min_lat - (bottom_rows > 0 ? lat_span : 0.0);
+    ce.bounds.min_lon = center.bounds.min_lon - (left_cols > 0 ? lon_span : 0.0);
+    ce.bounds.max_lon = center.bounds.max_lon + (right_cols > 0 ? lon_span : 0.0);
+
+    return ce;
+}
+
+/* Extract center-tile results from a composite-grid viewshed computation */
+static void extract_center_results(const CompositeElevation& ce,
+                                    const std::vector<uint8_t>& comp_vis,
+                                    const std::vector<float>& comp_sig,
+                                    std::vector<uint8_t>& tile_vis,
+                                    std::vector<float>& tile_sig)
+{
+    int cr = ce.center_rows;
+    int cc = ce.center_cols;
+    int total = cr * cc;
+    tile_vis.resize(total);
+    tile_sig.resize(total);
+
+    for (int r = 0; r < cr; ++r) {
+        int src_row = ce.center_row_start + r;
+        int src_off = src_row * ce.cols + ce.center_col_start;
+        int dst_off = r * cc;
+        for (int c = 0; c < cc; ++c) {
+            tile_vis[dst_off + c] = comp_vis[src_off + c];
+            tile_sig[dst_off + c] = comp_sig[src_off + c];
+        }
+    }
 }
 
 void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
                                            const GeoProjection& proj) {
-    /* Iterate all cached tiles, compute viewshed per tile, rebuild mesh */
+    /* Iterate all cached tiles, compute viewshed on composite (tile+neighbors) */
     m_cache.for_each_mut([&](TileRenderable& tr) {
         if (tr.elevation.empty() || tr.elev_rows < 2 || tr.elev_cols < 2)
             return;
@@ -362,20 +455,25 @@ void TileManager::apply_viewshed_overlays(const std::vector<NodeData>& nodes,
         tr.viewshed.assign(total, 0);
         tr.signal.assign(total, -999.0f);
 
-        /* Compute per-node viewshed on this tile's elevation grid
-           (only for nodes within this tile's bounds) */
-        auto tile_nodes = nodes_in_bounds(nodes, tr.bounds);
-        for (auto& nd : tile_nodes) {
+        /* Build composite elevation including neighbor tiles */
+        auto ce = build_composite_elevation(tr, m_cache);
+
+        for (auto& nd : nodes) {
             std::vector<uint8_t> vis;
             std::vector<float> sig;
-            compute_viewshed(tr.elevation.data(), tr.elev_rows, tr.elev_cols,
-                             tr.bounds, nd, vis, sig);
+            compute_viewshed(ce.data.data(), ce.rows, ce.cols,
+                             ce.bounds, nd, vis, sig);
+
+            /* Extract center tile results and merge */
+            std::vector<uint8_t> tile_vis;
+            std::vector<float> tile_sig;
+            extract_center_results(ce, vis, sig, tile_vis, tile_sig);
 
             for (int i = 0; i < total; ++i) {
-                if (vis[i]) {
+                if (tile_vis[i]) {
                     tr.viewshed[i] = 1;
-                    if (sig[i] > tr.signal[i])
-                        tr.signal[i] = sig[i];
+                    if (tile_sig[i] > tr.signal[i])
+                        tr.signal[i] = tile_sig[i];
                 }
             }
         }
@@ -401,16 +499,20 @@ void TileManager::apply_viewshed_overlays_gpu(const std::vector<NodeData>& nodes
         if (tr.elevation.empty() || tr.elev_rows < 2 || tr.elev_cols < 2)
             return;
 
-        int total = tr.elev_rows * tr.elev_cols;
+        /* Build composite elevation including neighbor tiles */
+        auto ce = build_composite_elevation(tr, m_cache);
 
-        /* Upload tile elevation and compute on GPU */
-        auto tile_nodes = nodes_in_bounds(nodes, tr.bounds);
-        gpu->upload_elevation(tr.elevation.data(), tr.elev_rows, tr.elev_cols);
-        gpu->set_grid_params(tr.bounds, tr.elev_rows, tr.elev_cols);
-        gpu->compute_all(tile_nodes);
+        /* Upload composite elevation and compute on GPU */
+        gpu->upload_elevation(ce.data.data(), ce.rows, ce.cols);
+        gpu->set_grid_params(ce.bounds, ce.rows, ce.cols);
+        gpu->compute_all(nodes);
 
-        std::vector<uint8_t> overlap;
-        gpu->read_back(tr.viewshed, tr.signal, overlap);
+        std::vector<uint8_t> comp_vis, comp_overlap;
+        std::vector<float> comp_sig;
+        gpu->read_back(comp_vis, comp_sig, comp_overlap);
+
+        /* Extract center tile results */
+        extract_center_results(ce, comp_vis, comp_sig, tr.viewshed, tr.signal);
 
         /* Rebuild mesh with overlay data (preserves texture) */
         Texture saved_tex = std::move(tr.texture);
@@ -452,13 +554,41 @@ void TileManager::drain_ready_tiles() {
     }
 }
 
+void TileManager::dispatch_tile_viewshed(size_t tile_idx,
+                                           const std::vector<NodeData>& nodes,
+                                           GpuViewshed* gpu) {
+    TileRenderable* tr = m_cache.get(m_tile_vs.tile_list[tile_idx]);
+    if (!tr) return;
+
+    auto ce = build_composite_elevation(*tr, m_cache);
+
+    /* Store composite metadata for extraction at readback time */
+    if (m_tile_vs.comp_info.size() <= tile_idx)
+        m_tile_vs.comp_info.resize(tile_idx + 1);
+    m_tile_vs.comp_info[tile_idx] = {
+        ce.rows, ce.cols,
+        ce.center_row_start, ce.center_col_start,
+        ce.center_rows, ce.center_cols
+    };
+
+    gpu->upload_elevation(ce.data.data(), ce.rows, ce.cols);
+    gpu->set_grid_params(ce.bounds, ce.rows, ce.cols);
+    gpu->compute_all_async(nodes, ce.data.data());
+}
+
 void TileManager::kick_viewshed_gpu(const std::vector<NodeData>& nodes,
                                       const GeoProjection& proj,
                                       GpuViewshed* gpu) {
     if (!gpu) return;
 
+    /* Clear stale overlay textures so tiles don't show old data during recompute */
+    m_cache.for_each_mut([](TileRenderable& tr) {
+        tr.destroy_overlay_textures();
+    });
+
     /* Collect all tiles that have elevation data */
     m_tile_vs.tile_list.clear();
+    m_tile_vs.comp_info.clear();
     m_cache.for_each([&](const TileRenderable& tr) {
         if (!tr.elevation.empty() && tr.elev_rows >= 2 && tr.elev_cols >= 2)
             m_tile_vs.tile_list.push_back(tr.coord);
@@ -468,15 +598,10 @@ void TileManager::kick_viewshed_gpu(const std::vector<NodeData>& nodes,
 
     m_tile_vs.current_tile = 0;
     m_tile_vs.active = true;
+    m_tile_vs.comp_info.resize(m_tile_vs.tile_list.size());
 
-    /* Dispatch first tile — only with nodes that fall within it */
-    TileRenderable* tr = m_cache.get(m_tile_vs.tile_list[0]);
-    if (tr) {
-        auto tile_nodes = nodes_in_bounds(nodes, tr->bounds);
-        gpu->upload_elevation(tr->elevation.data(), tr->elev_rows, tr->elev_cols);
-        gpu->set_grid_params(tr->bounds, tr->elev_rows, tr->elev_cols);
-        gpu->compute_all_async(tile_nodes, tr->elevation.data());
-    }
+    /* Dispatch first tile with composite elevation */
+    dispatch_tile_viewshed(0, nodes, gpu);
 }
 
 void TileManager::poll_viewshed_gpu(const std::vector<NodeData>& nodes,
@@ -485,17 +610,32 @@ void TileManager::poll_viewshed_gpu(const std::vector<NodeData>& nodes,
     if (!gpu || !m_tile_vs.active) return;
     if (gpu->poll_state() != ComputeState::READY) return;
 
-    /* Read back results for current tile and upload as overlay textures */
+    /* Read back composite results and extract center tile portion */
     size_t idx = m_tile_vs.current_tile;
     if (idx < m_tile_vs.tile_list.size()) {
         TileRenderable* tr = m_cache.get(m_tile_vs.tile_list[idx]);
         if (tr) {
             auto t0 = std::chrono::steady_clock::now();
-            std::vector<uint8_t> overlap;
-            gpu->read_back_async(tr->viewshed, tr->signal, overlap);
+
+            /* Read back full composite results */
+            std::vector<uint8_t> comp_vis, comp_overlap;
+            std::vector<float> comp_sig;
+            gpu->read_back_async(comp_vis, comp_sig, comp_overlap);
             auto t1 = std::chrono::steady_clock::now();
 
-            /* Upload as GPU overlay textures (skips full mesh rebuild) */
+            /* Extract center tile portion */
+            auto& ci = m_tile_vs.comp_info[idx];
+            CompositeElevation ce;
+            ce.rows = ci.comp_rows;
+            ce.cols = ci.comp_cols;
+            ce.center_row_start = ci.center_row_start;
+            ce.center_col_start = ci.center_col_start;
+            ce.center_rows = ci.center_rows;
+            ce.center_cols = ci.center_cols;
+            extract_center_results(ce, comp_vis, comp_sig,
+                                    tr->viewshed, tr->signal);
+
+            /* Upload as GPU overlay textures */
             tr->upload_overlay_textures(tr->viewshed.data(), tr->signal.data(),
                                          tr->elev_rows, tr->elev_cols);
             auto t2 = std::chrono::steady_clock::now();
@@ -511,13 +651,7 @@ void TileManager::poll_viewshed_gpu(const std::vector<NodeData>& nodes,
     /* Advance to next tile */
     m_tile_vs.current_tile++;
     if (m_tile_vs.current_tile < m_tile_vs.tile_list.size()) {
-        TileRenderable* tr = m_cache.get(m_tile_vs.tile_list[m_tile_vs.current_tile]);
-        if (tr) {
-            auto tile_nodes = nodes_in_bounds(nodes, tr->bounds);
-            gpu->upload_elevation(tr->elevation.data(), tr->elev_rows, tr->elev_cols);
-            gpu->set_grid_params(tr->bounds, tr->elev_rows, tr->elev_cols);
-            gpu->compute_all_async(tile_nodes, tr->elevation.data());
-        }
+        dispatch_tile_viewshed(m_tile_vs.current_tile, nodes, gpu);
     } else {
         /* All tiles done */
         m_tile_vs.active = false;

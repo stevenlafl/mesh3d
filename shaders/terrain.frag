@@ -56,44 +56,44 @@ void main() {
 
     vec3 color = baseColor * lighting;
 
-    // Resolve overlay values — prefer GPU textures over vertex attributes
-    float viewshed_val = vViewshed;
-    float signal_val = vSignalDbm;
+    // Resolve overlay values — GPU textures only; no vertex attribute fallback.
+    // Tiles always use overlay textures; vertex attributes are unused in tile mode.
+    float viewshed_val = 0.0;
+    float signal_val = -999.0;
     if (uUseOverlayTex > 0) {
         viewshed_val = texture(uOverlayVisTex, vUV).r;
         signal_val = texture(uOverlaySigTex, vUV).r;
     }
 
-    // Overlay
+    // Overlay — only draw where cell is visible and signal is within display range.
+    // Display minimum: -130 dBm (bottom of signal color scale).
+    // Areas below this threshold are left as clean map/terrain.
+    float displayMin = -130.0;
+
     if (uOverlayMode == 1) {
-        // Viewshed: tint visible areas green
-        if (viewshed_val > 0.5) {
+        // Viewshed: tint covered areas green
+        if (viewshed_val > 0.5 && signal_val >= displayMin) {
             color = mix(color, vec3(0.0, 1.0, 0.0), 0.35);
-        } else {
-            color *= 0.5; // darken non-visible
         }
     } else if (uOverlayMode == 2) {
         // Signal strength heatmap
-        if (signal_val > -900.0) {
+        if (viewshed_val > 0.5 && signal_val >= displayMin) {
             vec3 sc = signalColor(signal_val);
-            color = mix(color, sc, 0.6);
+            color = mix(color, sc, 0.5);
         }
     } else if (uOverlayMode == 3) {
         // Link margin overlay
-        if (signal_val > -900.0) {
+        if (viewshed_val > 0.5 && signal_val >= uRxSensitivity) {
             float margin = signal_val - uRxSensitivity;
             vec3 mc;
-            if (margin < 0.0) {
-                mc = vec3(0.0); // black — no link
-            } else if (margin < 10.0) {
-                mc = mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), margin / 10.0); // red->yellow
+            if (margin < 10.0) {
+                mc = mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), margin / 10.0);
             } else if (margin < 20.0) {
-                mc = mix(vec3(1.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0), (margin - 10.0) / 10.0); // yellow->green
+                mc = mix(vec3(1.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0), (margin - 10.0) / 10.0);
             } else {
-                mc = vec3(0.0, 1.0, 0.0); // strong green
+                mc = vec3(0.0, 1.0, 0.0);
             }
-            float blend = margin < 0.0 ? 0.3 : 0.6;
-            color = mix(color, mc, blend);
+            color = mix(color, mc, 0.5);
         }
     }
 

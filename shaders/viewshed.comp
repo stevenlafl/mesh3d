@@ -102,12 +102,9 @@ void main() {
 
     float received = eirp - fspl - diff_loss_db;
 
-    /* Visibility based on RX sensitivity threshold */
-    if (received >= uRxSensitivityDbm) {
-        imageStore(uVisibility, gid, uvec4(1, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
-    } else {
-        imageStore(uVisibility, gid, uvec4(0, 0, 0, 0));
-        imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
-    }
+    /* Visibility: 1 = signal reaches receiver above sensitivity.
+       Signal is always written so the shader can threshold by display range. */
+    uint vis = (received >= uRxSensitivityDbm) ? 1u : 0u;
+    imageStore(uVisibility, gid, uvec4(vis, 0, 0, 0));
+    imageStore(uSignal, gid, vec4(received, 0.0, 0.0, 0.0));
 }

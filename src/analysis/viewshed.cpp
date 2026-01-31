@@ -22,10 +22,11 @@ void compute_viewshed(const float* elevation, int rows, int cols,
 
     int nr = static_cast<int>((bounds.max_lat - node.info.lat) / lat_res);
     int nc = static_cast<int>((node.info.lon - bounds.min_lon) / lon_res);
-    nr = std::clamp(nr, 0, rows - 1);
-    nc = std::clamp(nc, 0, cols - 1);
 
-    float node_elev = elevation[nr * cols + nc];
+    /* Node may be off-grid (on an adjacent tile); use nearest edge cell for elevation */
+    int nr_elev = std::clamp(nr, 0, rows - 1);
+    int nc_elev = std::clamp(nc, 0, cols - 1);
+    float node_elev = elevation[nr_elev * cols + nc_elev];
     float antenna_h = node.info.antenna_height_m;
     if (antenna_h < 1.0f) antenna_h = 2.0f;
     float obs_h = node_elev + antenna_h;
@@ -48,20 +49,10 @@ void compute_viewshed(const float* elevation, int rows, int cols,
     float rx_sens = node.info.rx_sensitivity_dbm;
     if (rx_sens >= 0) rx_sens = -132.0f; // default
 
-    /* Max range from link budget: distance where FSPL alone exceeds budget.
-       Terrain and diffraction further reduce actual coverage. */
+    /* Max range: full grid diagonal — let signal attenuation handle clipping */
     float eirp = tx_power_dbm + antenna_gain - cable_loss;
-    float max_path_loss = eirp - rx_sens;
-    float log_d_km = (max_path_loss - 20.0f * std::log10(freq_mhz) - 32.44f) / 20.0f;
-    float max_range_km = std::pow(10.0f, log_d_km);
-
-    /* Cap at grid diagonal */
-    float grid_diag_km = std::sqrt(static_cast<float>(rows * rows + cols * cols))
-                         * cell_m / 1000.0f;
-    if (max_range_km > grid_diag_km) max_range_km = grid_diag_km;
-
-    int max_range_cells = static_cast<int>(max_range_km * 1000.0f / cell_m);
-    if (max_range_cells < 1) max_range_cells = 1;
+    int max_range_cells = static_cast<int>(
+        std::sqrt(static_cast<float>(rows * rows + cols * cols)));
 
     /* Earth curvature factor: 1 / (2 * k * Re) where k=4/3, Re=6371000m */
     const float earth_curve_factor = 1.0f / (2.0f * (4.0f / 3.0f) * 6371000.0f);
