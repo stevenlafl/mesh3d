@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A standalone C++17 application that renders Meshtastic radio viewshed data in 3D. It reads terrain elevation, node positions, and signal coverage data from a PostGIS database (or via direct C API injection), then renders an interactive 3D scene with:
+A standalone C++17 application that renders Meshtastic radio viewshed data in 3D. It reads terrain elevation from SRTM HGT files, and accepts node positions and signal coverage data via the C API, then renders an interactive 3D scene with:
 
 - Heightmap terrain with viewshed/signal heatmap overlays
 - Opaque icosphere markers at each radio node (color-coded by role)
@@ -28,64 +28,15 @@ docker compose run --rm build
 
 Output: `build/mesh3d` (executable), `build/libmesh3d.so` (shared library).
 
-The build container (Ubuntu 24.04) has: build-essential, cmake, libsdl2-dev, libgl-dev, libglm-dev, libpq-dev.
-
-To start the PostGIS database:
-```sh
-docker compose up -d db
-```
-Database runs on port **5434** (not 5432) with user/pass/db all `mesh3d`.
-
----
-
-## Python Environment
-
-A local venv is used for the import scripts. The host is a locked environment — do not use `pip install` directly.
-
-```sh
-# Already created at .venv/. To recreate:
-python3 -m venv .venv
-.venv/bin/pip install psycopg2-binary numpy
-
-# Always run Python scripts via the venv:
-.venv/bin/python scripts/import_viewshed.py ...
-```
-
----
-
-## Import Data
-
-The import script reads SRTM `.hgt` terrain files (from the sibling `mesh-mapgen` project), places synthetic nodes, computes simple line-of-sight viewsheds, and writes everything to the mesh3d PostGIS database.
-
-```sh
-# Ensure DB is running first:
-docker compose up -d db
-
-# Import from SRTM HGT files (Colorado region example):
-.venv/bin/python scripts/import_viewshed.py \
-  --dest-db "host=localhost port=5434 dbname=mesh3d user=mesh3d password=mesh3d" \
-  --hgt-dir /home/stevenlafl/Projects/mesh-mapgen/data/terrain \
-  --center-lat 38.5 --center-lon -105.5 --radius-km 15 \
-  --project-name "Colorado Test"
-
-# Other import modes:
-#   --source-db "dbname=mesh_mapgen"   # from mesh-mapgen postgres
-#   --npz data.npz                     # from numpy archive
-```
-
-HGT files are elevation-only (no satellite imagery). The terrain tiles live at:
-`/home/stevenlafl/Projects/mesh-mapgen/data/terrain/` (32 SRTM files covering Colorado, N37-N40 W103-W110).
+The build container (Ubuntu 24.04) has: build-essential, cmake, libsdl2-dev, libgl-dev, libglm-dev.
 
 ---
 
 ## Run
 
 ```sh
-# Demo mode (synthetic terrain, no DB needed):
+# Demo mode (synthetic terrain):
 ./build/mesh3d
-
-# With database (after importing):
-./build/mesh3d --db "host=localhost port=5434 dbname=mesh3d user=mesh3d password=mesh3d" --project 1
 
 # Other flags:
 #   --width W --height H --debug --help
@@ -100,15 +51,11 @@ Note: requires a display server and OpenGL 3.3 support on the host (the app crea
 ```
 mesh3d/
 ├── CMakeLists.txt                     # Build: targets mesh3d_lib (shared) + mesh3d_app (exe)
-├── docker-compose.yml                 # Services: db (PostGIS:5433), build (compile container)
+├── docker-compose.yml                 # Services: build (compile container)
 ├── docker/
-│   ├── Dockerfile.build               # Build image: Ubuntu 24.04 + dev packages
-│   └── init.sql                       # DB schema: projects, nodes, elevations, viewsheds, coverage
-├── scripts/
-│   ├── import_viewshed.py             # Python ETL: mesh-mapgen or .npz -> PostGIS
-│   └── requirements.txt               # psycopg2-binary, numpy
+│   └── Dockerfile.build               # Build image: Ubuntu 24.04 + dev packages
 ├── include/mesh3d/
-│   ├── mesh3d.h                       # PUBLIC C ABI (lifecycle, DB, data injection, control, loop)
+│   ├── mesh3d.h                       # PUBLIC C ABI (lifecycle, data injection, control, loop)
 │   └── types.h                        # PUBLIC C structs/enums (bounds, grids, nodes, modes)
 ├── src/
 │   ├── main.cpp                       # Entry point, CLI arg parsing
@@ -117,10 +64,6 @@ mesh3d/
 │   ├── camera/
 │   │   ├── camera.h / camera.cpp      # 6DOF camera: position, yaw/pitch, view/proj matrices
 │   │   └── input.h / input.cpp        # SDL2 events -> movement, toggles, mouse capture
-│   ├── db/
-│   │   ├── db.h / db.cpp             # libpq wrapper: connect, exec, exec_params, Result RAII
-│   │   ├── schema.h                   # SQL query constants (parameterized, PostGIS functions)
-│   │   └── loader.h / loader.cpp      # DataLoader: DB -> Scene (bounds, elevation, nodes, coverage)
 │   ├── render/
 │   │   ├── renderer.h / renderer.cpp  # Orchestrates opaque + transparent passes, owns 4 shaders
 │   │   ├── shader.h / shader.cpp      # GLSL compile/link, uniform setters
@@ -157,14 +100,13 @@ App (singleton: static g_app in app.cpp, accessed via app())
  ├─ Scene        ← data holder (elevation[], nodes[], viewshed[], meshes, textures)
  ├─ Camera       ← position, orientation, projection
  ├─ Renderer     ← owns 4 Shader objects, drives GL draw calls
- ├─ InputHandler ← SDL event processing, held-key state, toggle flags
- └─ Database     ← libpq connection (optional)
+ └─ InputHandler ← SDL event processing, held-key state, toggle flags
 ```
 
 Data flows in one direction:
 
 ```
-[PostGIS DB] or [C API injection] or [Synthetic demo]
+[C API injection] or [Synthetic demo]
         ↓
   Scene raw data (elevation, nodes, viewshed arrays)
         ↓
@@ -210,12 +152,12 @@ Data flows in one direction:
 
 | Element | Convention | Examples |
 |---------|-----------|----------|
-| Namespace | `mesh3d`, `mesh3d::sql` | |
-| Classes | PascalCase | `App`, `Camera`, `Renderer`, `Shader`, `Mesh`, `Texture`, `Database`, `DataLoader` |
+| Namespace | `mesh3d` | |
+| Classes | PascalCase | `App`, `Camera`, `Renderer`, `Shader`, `Mesh`, `Texture` |
 | Structs | PascalCase | `Scene`, `NodeData`, `TerrainBuildData`, `GeoProjection` |
-| Member vars | `m_` prefix | `m_window`, `m_conn`, `m_program`, `m_vao`, `m_quit` |
+| Member vars | `m_` prefix | `m_window`, `m_program`, `m_vao`, `m_quit` |
 | Free functions | snake_case | `build_terrain_mesh()`, `build_icosphere()`, `role_color()` |
-| C ABI functions | `mesh3d_` prefix | `mesh3d_init()`, `mesh3d_load_project()` |
+| C ABI functions | `mesh3d_` prefix | `mesh3d_init()`, `mesh3d_set_terrain()` |
 | C types | `mesh3d_` prefix + `_t` | `mesh3d_bounds_t`, `mesh3d_node_t` |
 | Shader uniforms | `u` prefix | `uModel`, `uView`, `uProj`, `uColor` |
 | Shader attributes | `a` prefix | `aPos`, `aNormal`, `aUV` |
@@ -227,7 +169,6 @@ Data flows in one direction:
 
 Internal `src/` headers use quoted paths relative to `src/`:
 ```cpp
-#include "db/db.h"           // from any file in src/
 #include "render/shader.h"
 #include "util/log.h"
 #include "scene/scene.h"
@@ -245,14 +186,11 @@ Third-party:
 #include <glm/glm.hpp>       // system or third_party/glm/
 #include <stb_image.h>       // third_party/stb/
 #include <SDL2/SDL.h>        // system
-#include <libpq-fe.h>        // system
 ```
 
 ### RAII / Ownership
 
 `Mesh`, `Shader`, `Texture` are **move-only** types. They hold OpenGL handles (VAO/VBO/EBO, program, texture ID) and delete them in destructors. Copy constructors are deleted; move constructors null out the source.
-
-`Database::Result` wraps `PGresult*` with auto-`PQclear` on destruction.
 
 ### Adding a New Shader
 
@@ -269,13 +207,6 @@ Third-party:
 4. Add render calls in `Renderer::opaque_pass()` or `transparent_pass()`.
 5. Add the `.cpp` to `LIB_SOURCES` in `CMakeLists.txt`.
 
-### Adding a New Database Table/Query
-
-1. Add the table to `docker/init.sql`.
-2. Add query constants to `src/db/schema.h`.
-3. Add a `load_*()` method to `DataLoader` (`src/db/loader.h` / `.cpp`).
-4. Call it from `DataLoader::load_project()`.
-
 ### Vertex Attribute Layouts
 
 | Mesh Type | Stride | Attributes |
@@ -283,23 +214,6 @@ Third-party:
 | Terrain | 10 floats (40B) | 0:pos(3), 1:normal(3), 2:uv(2), 3:viewshed(1), 4:signal_dbm(1) |
 | Flat plane | 5 floats (20B) | 0:pos(3), 1:uv(2) |
 | Marker/Sphere | 6 floats (24B) | 0:pos(3), 1:normal(3) |
-
----
-
-## Database Schema
-
-PostGIS on port **5433**. Connection: `host=localhost port=5433 dbname=mesh3d user=mesh3d password=mesh3d`.
-
-| Table | Key Columns | Notes |
-|-------|-------------|-------|
-| `projects` | id, name, bounds (Polygon 4326), min/max lat/lon | |
-| `hardware_profiles` | tx_power_dbm, antenna_gain_dbi, rx_sensitivity_dbm, frequency_mhz, spreading_factor | |
-| `nodes` | project_id FK, name, location (PointZ 4326), role (0=backbone/1=relay/2=leaf), max_range_km | |
-| `elevation_grids` | project_id FK, grid_rows, grid_cols, bounds, elevation_data (BYTEA float32) | Row-major |
-| `viewshed_results` | node_id FK, project_id FK, visibility_data (BYTEA uint8), signal_strength_data (BYTEA float32) | Per-node |
-| `merged_coverages` | project_id FK, combined_visibility (BYTEA uint8), overlap_count_data (BYTEA uint8) | Combined |
-
-All grid data is raw BYTEA: row-major, directly `memcpy`-able to C++ arrays. The loader decodes libpq's hex-encoded text format (`\x` prefix + hex pairs).
 
 ---
 
@@ -312,12 +226,7 @@ All functions are `extern "C"` with `MESH3D_API` visibility. Return `int` (1=ok,
 mesh3d_init(w, h, title)        // SDL window + GL context + shader load
 mesh3d_shutdown()
 
-// Database (optional)
-mesh3d_connect_db(conninfo)     // libpq connection string
-mesh3d_load_project(project_id) // loads everything into scene
-mesh3d_disconnect_db()
-
-// Direct injection (alternative to DB)
+// Direct data injection
 mesh3d_set_terrain(grid, bounds)
 mesh3d_add_node(node)                          // returns node index
 mesh3d_set_viewshed(node_idx, vis, signal)
@@ -356,7 +265,5 @@ mesh3d_frame(dt)
 | Add new overlay mode | `include/mesh3d/types.h` (enum), `shaders/terrain.frag`, `src/render/renderer.cpp` |
 | Modify camera behavior | `src/camera/camera.h` (speeds/fov), `src/camera/input.cpp` (key bindings) |
 | Add new keyboard shortcut | `src/camera/input.h` (flag), `src/camera/input.cpp` (key handler), `src/app.cpp` (`handle_toggles`) |
-| Change DB queries | `src/db/schema.h` (SQL), `src/db/loader.cpp` (parsing) |
-| Modify DB schema | `docker/init.sql`, then `docker compose down -v && docker compose up -d db` to recreate |
 | Add new C ABI function | `include/mesh3d/mesh3d.h` (declaration), `src/cabi/cabi.cpp` (impl), `src/app.h` (method) |
 | Add new source file | Create file, add to `LIB_SOURCES` in `CMakeLists.txt` |

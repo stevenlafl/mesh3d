@@ -21,12 +21,7 @@ extern "C" {
 MESH3D_API int  mesh3d_init(int w, int h, const char* title);
 MESH3D_API void mesh3d_shutdown(void);
 
-/* ── Database (deprecated — stubs for ABI compatibility) ───────────── */
-MESH3D_API int  mesh3d_connect_db(const char* conninfo);
-MESH3D_API int  mesh3d_load_project(int project_id);
-MESH3D_API void mesh3d_disconnect_db(void);
-
-/* ── Direct data injection (no DB needed) ─────────────────────────── */
+/* ── Direct data injection ────────────────────────────────────────── */
 MESH3D_API int  mesh3d_set_terrain(mesh3d_grid_f32_t grid, mesh3d_bounds_t bounds);
 MESH3D_API int  mesh3d_add_node(mesh3d_node_t node);
 MESH3D_API int  mesh3d_set_viewshed(int node_idx, mesh3d_grid_u8_t vis, mesh3d_grid_f32_t signal);

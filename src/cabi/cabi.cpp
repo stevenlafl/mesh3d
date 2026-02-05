@@ -11,18 +11,6 @@ void mesh3d_shutdown(void) {
     app().shutdown();
 }
 
-/* DB functions are stubs for ABI compatibility */
-int mesh3d_connect_db(const char* /*conninfo*/) {
-    return 0;
-}
-
-int mesh3d_load_project(int /*project_id*/) {
-    return 0;
-}
-
-void mesh3d_disconnect_db(void) {
-}
-
 int mesh3d_set_terrain(mesh3d_grid_f32_t grid, mesh3d_bounds_t bounds) {
     return app().set_terrain(grid, bounds) ? 1 : 0;
 }
