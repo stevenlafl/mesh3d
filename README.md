@@ -57,7 +57,17 @@ Output: `build/mesh3d` (executable) and `build/libmesh3d.so` (shared library).
 ./build/mesh3d --width 1920 --height 1080 --debug
 ```
 
-Requires a display server and OpenGL 3.3 support on the host.
+Requires a display server and OpenGL 3.3 support on the host. No pre-downloaded data is needed — everything is fetched on the fly.
+
+## Streaming and Caching
+
+The application dynamically streams all terrain and imagery data based on the camera position. Nothing needs to be downloaded ahead of time.
+
+**Elevation:** SRTM HGT tiles (1° x 1°) are fetched from AWS S3 (`elevation-tiles-prod/skadi`), decompressed from gzip, and cached to `~/.cache/mesh3d/hgt/`. As the camera moves, nearby tiles are loaded automatically — up to 4 at a time based on proximity to tile edges.
+
+**Imagery:** Satellite tiles (Esri World Imagery) and street map tiles (OpenStreetMap) use standard slippy map URLs at zoom level 13. Downloaded tiles are cached to `~/.cache/mesh3d/tiles/` and composited to match the elevation tile bounds.
+
+**Pipeline:** All network fetches happen on a background worker thread. Completed tiles are drained on the main thread with a 4ms per-frame budget to avoid stutter. An LRU cache (128 tiles) manages GPU memory, evicting the least recently used tiles when full.
 
 ## Controls
 
